@@ -9,13 +9,17 @@ use essa_test_function::{
 fn main() {
     println!("Testing R integration!");
     let args = essa_common::Rargs {
-        args: Some(vec![("x".to_string(), vec![2.0]), ("y".to_string(), vec![4.0])]),
+        args: Some(vec![
+            ("x".to_string(), vec![2.0, 4.0]),
+            ("y".to_string(), vec![4.0, 3.0]),
+        ]),
     };
     let args = essa_api::bincode::serialize(&args).expect("error at serialize args");
     let result = essa_api::run_r("function(x,y){x*y}", &args).unwrap();
     let serialized_result = result.wait().unwrap();
     println!("Serialized R result: {:?}", serialized_result);
-    let result: Result<essa_common::Rreturn, Box<bincode::ErrorKind>> = essa_api::bincode::deserialize(&serialized_result);
+    let result: Result<essa_common::Rreturn, Box<bincode::ErrorKind>> =
+        essa_api::bincode::deserialize(&serialized_result);
     println!("Result from R: {:?}", result);
 
     println!("Hello world from test function!");

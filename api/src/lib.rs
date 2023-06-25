@@ -6,8 +6,8 @@
 use std::{thread, time::Duration};
 
 use crate::c_api::{
-    essa_get_args, essa_get_lattice_data, essa_get_lattice_len, essa_put_lattice, essa_set_result,
-    essa_run_r,
+    essa_get_args, essa_get_lattice_data, essa_get_lattice_len, essa_put_lattice, essa_run_r,
+    essa_set_result,
 };
 use anna_api::{ClientKey, LatticeValue};
 use c_api::{essa_call, essa_get_result, essa_get_result_len};

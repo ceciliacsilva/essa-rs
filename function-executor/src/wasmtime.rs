@@ -7,7 +7,7 @@
 use crate::{get_args, get_module, kvs_get, kvs_put, EssaResult, FunctionExecutor};
 use anna::{lattice::LastWriterWinsLattice, nodes::ClientNode, ClientKey};
 use anyhow::{bail, Context};
-use essa_common::scheduler_function_call_topic;
+use essa_common::{scheduler_function_call_topic, scheduler_run_r_function_call_topic};
 use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
 use wasmtime::{Caller, Engine, Extern, Linker, Module, Store, ValType};
@@ -434,9 +434,8 @@ fn essa_run_r_wrapper(
 
             Ok(EssaResult::Ok)
         }
-        Err(err) => Ok(err)
+        Err(err) => Ok(err),
     }
-
 }
 
 fn essa_get_result_len_wrapper(
@@ -821,7 +820,7 @@ async fn run_r_extern(
     zenoh: Arc<zenoh::Session>,
     zenoh_prefix: &str,
 ) -> anyhow::Result<flume::Receiver<Reply>> {
-    let topic = format!("essa/{func_key}/run_r/{args_key}"); //scheduler_function_call_topic(zenoh_prefix, &module_key, &function_name, &args_key);
+    let topic = scheduler_run_r_function_call_topic(zenoh_prefix, &func_key, &args_key);
 
     // send the request to the scheduler node
     let reply = zenoh

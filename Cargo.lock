@@ -2378,6 +2378,7 @@ dependencies = [
  "anna",
  "anyhow",
  "argh",
+ "chrono",
  "essa-api",
  "essa-common",
  "extendr-api",

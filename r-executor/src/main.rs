@@ -1,7 +1,4 @@
 #![warn(missing_docs)]
-use essa_common::{
-    essa_default_zenoh_prefix, executor_run_function_subscribe_topic, executor_run_module_topic,
-};
 use anna::{
     anna_default_zenoh_prefix,
     lattice::Lattice,
@@ -10,25 +7,65 @@ use anna::{
     topics::RoutingThread,
     ClientKey,
 };
-use anyhow::{bail, Context};
-use uuid::Uuid;
-use extendr_api::prelude::*;
-use extendr_api::{io::PstreamFormat, io::Save, io::Load, Robj};
-use extendr_api::serializer::to_robj;
+use anyhow::Context;
+use essa_common::{essa_default_zenoh_prefix, executor_run_r_subscribe_topic};
 use extendr_api::deserializer::from_robj;
-use zenoh::{prelude::r#async::*, query::Reply, queryable::Query};
-use serde::Serialize;
+use extendr_api::prelude::*;
+use extendr_api::Robj;
+use std::{sync::Arc, time::Duration};
+use uuid::Uuid;
 use zenoh::prelude::r#async::*;
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
 
-pub async fn r_executor(
+/// Starts a essa R executor.
+///
+/// The given ID must be an unique identifier for this executor instance, i.e.
+/// there must not be another active executor instance with the same id.
+#[derive(argh::FromArgs, Debug, Clone)]
+struct Args {
+    #[argh(positional)]
+    id: u32,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    if let Err(err) = set_up_logger() {
+        eprintln!(
+            "ERROR: {:?}",
+            anyhow::anyhow!(err).context("Failed to set up logget")
+        );
+    }
+
+    let args: Args = argh::from_env();
+
+    let zenoh = Arc::new(
+        zenoh::open(zenoh::config::Config::default())
+            .res()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+            .context("Failed to connect to zenoh")?,
+    );
+
+    let zenoh_prefix = essa_default_zenoh_prefix().to_owned();
+    extendr_engine::start_r();
+    r_executor(args, zenoh, zenoh_prefix).await?;
+    extendr_engine::end_r();
+
+    Ok(())
+}
+
+/// R-executor.
+async fn r_executor(
+    args: Args,
     zenoh: Arc<zenoh::Session>,
-    zenoh_prefix: String,) -> anyhow::Result<()> {
+    zenoh_prefix: String,
+) -> anyhow::Result<()> {
+    // This should not be hardcoded.
+    let executor = args.id;
+
+    let topic = executor_run_r_subscribe_topic(&zenoh_prefix, executor);
     log::info!("Starting R executor!");
-    let reply = zenoh.declare_queryable("essa/*/run_r/*")
+    let reply = zenoh
+        .declare_queryable(topic)
         .res()
         .await
         .map_err(|e| anyhow::anyhow!(e))
@@ -44,10 +81,6 @@ pub async fn r_executor(
                     .next_back()
                     .context("no args key in topic")?
                     .to_owned();
-                let _run_r = topic_split
-                    .next_back()
-                    .context("no run_r in topic")?
-                    .to_owned();
                 let func = topic_split
                     .next_back()
                     .context("no func in topic")?
@@ -58,30 +91,35 @@ pub async fn r_executor(
                 let mut serialized_result: Vec<u8> = Vec::new();
 
                 {
-                    let func = func.into_lww()
-                                   .map_err(eyre_to_anyhow)
-                                   .context("func is not a LWW lattice")?
-                                   .into_revealed()
-                                   .into_value();
-                    let args = args.into_lww()
-                                   .map_err(eyre_to_anyhow)
-                                   .context("args is not a LWW lattice")?
-                                   .into_revealed()
-                                   .into_value();
+                    let func = func
+                        .into_lww()
+                        .map_err(eyre_to_anyhow)
+                        .context("func is not a LWW lattice")?
+                        .into_revealed()
+                        .into_value();
+                    let args = args
+                        .into_lww()
+                        .map_err(eyre_to_anyhow)
+                        .context("args is not a LWW lattice")?
+                        .into_revealed()
+                        .into_value();
 
-                    let args
-                        = essa_api::bincode::deserialize(&args);
+                    let args = essa_api::bincode::deserialize(&args);
 
                     let args: essa_common::Rargs = args.unwrap();
                     let func = String::from_utf8(func)?;
                     // this is a problem, because there is single_threaded instruction.
                     let func = eval_string(&func).expect("erro parse");
 
-                    let res: Robj = func.call(Pairlist::from_pairs(args.args.unwrap())).expect("failed to call func");
-                    let res: essa_common::Rreturn =
-                        essa_common::Rreturn { result: from_robj(&res).unwrap() };
+                    let res: Robj = func
+                        .call(Pairlist::from_pairs(args.args.unwrap()))
+                        .expect("failed to call func");
+                    let res: essa_common::Rreturn = essa_common::Rreturn {
+                        result: from_robj(&res).unwrap(),
+                    };
 
-                    serialized_result = essa_api::bincode::serialize(&res).expect("erro serialize res");
+                    serialized_result =
+                        essa_api::bincode::serialize(&res).expect("erro serialize res");
                 }
 
                 query
@@ -89,7 +127,7 @@ pub async fn r_executor(
                     .res()
                     .await
                     .expect("failed to send sample back");
-            },
+            }
             Err(e) => {
                 log::debug!("zenoh error {e:?}");
                 break;
@@ -99,41 +137,6 @@ pub async fn r_executor(
 
     Ok(())
 }
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let zenoh = Arc::new(
-        zenoh::open(zenoh::config::Config::default())
-            .res()
-            .await
-            .map_err(|e| anyhow::anyhow!(e))
-            .context("Failed to connect to zenoh")?,
-    );
-
-    let zenoh_prefix = essa_default_zenoh_prefix().to_owned();
-
-    extendr_engine::start_r();
-    r_executor(zenoh, zenoh_prefix).await;
-    extendr_engine::end_r();
-
-    Ok(())
-}
-
-// /// Store the given value in the key-value store.
-// fn kvs_put(key: ClientKey, value: LatticeValue, anna: &mut ClientNode) -> anyhow::Result<()> {
-//     let start = Instant::now();
-
-//     smol::block_on(anna.put(key, value))
-//         .map_err(eyre_to_anyhow)
-//         .context("put failed")?;
-
-//     let put_latency = (Instant::now() - start).as_millis();
-//     if put_latency >= 100 {
-//         log::trace!("high kvs_put latency: {}ms", put_latency);
-//     }
-
-//     Ok(())
-// }
 
 /// Get the given value in the key-value store.
 ///
@@ -188,98 +191,23 @@ fn eyre_to_anyhow(err: eyre::Report) -> anyhow::Error {
     anyhow::anyhow!(err)
 }
 
-
-
-// fn main() -> anyhow::Result<()> {
-
-//     extendr_engine::start_r();
-//     // An R object with a single string "hello"
-//     let character = r!("hello");
-//     println!("{:?}", character);
-//     let character = r!(["hello", "goodbye"]);
-//     println!("{:?}", character);
-
-//     let function = R!("function(x, y) {x+y}").expect("cannot create a `function`");
-//     println!("{:?}", function.call(pairlist!(1, 2)));
-
-//     let env: Environment = new_env(global_env(), true, 10).try_into().unwrap();
-//     env.set_local(sym!(x), "hello");
-//     assert_eq!(env.local(sym!(x)), Ok(r!("hello")));
-
-//     let _env = new_env(current_env(), false, 10);
-
-//     let names_and_values = (0..100).map(|i| (format!("n{}", i), i));
-//     let env = Environment::from_pairs(global_env(), names_and_values);
-//     let expr = env.clone();
-//     assert_eq!(expr.len(), 100);
-//     let env2 = expr.as_environment().unwrap();
-//     assert_eq!(env2.len(), 100);
-
-//     println!("env: {:?}", env);
-//     println!("ls env: {:?}", lang!("ls", env.clone()).eval());
-
-
-//     let mut w = Vec::new();
-//     // to entire sure that this can use asciiformat
-//     function.to_writer(&mut w, PstreamFormat::AsciiFormat, 3, None).unwrap();
-
-//     let c = String::from_utf8(w)?;
-//     let mut c = std::io::Cursor::new(c);
-//     let res = Robj::from_reader(&mut c, PstreamFormat::AsciiFormat, None).unwrap();
-//     assert_eq!(res.call(pairlist!(1, 2)).unwrap(), r!(3));
-
-//     let promise = Promise::from_parts(r!(1), global_env()).unwrap();
-//     assert!(promise.value().is_unbound_value());
-//     assert_eq!(promise.eval_promise().unwrap(), r!(1));
-//     assert_eq!(promise.value(), r!(1));
-
-//     #[derive(Serialize)]
-//     struct Rfloat2(Rfloat);
-//     let s = Rfloat2(Rfloat::na());
-//     let expected = r!(());
-//     assert_eq!(to_robj(&s).unwrap(), Robj::from(expected));
-
-//     #[derive(Serialize)]
-//     struct Test<'a> {
-//         int: i32,
-//         seq: Vec<&'a str>,
-//     }
-
-//     let test = Test {
-//         int: 1,
-//         seq: vec!["a", "b"],
-//     };
-
-//     let expected = list!(int=1, seq=list!("a", "b"));
-//     assert_eq!(to_robj(&test).unwrap(), Robj::from(expected));
-
-//     //let result = function.call(pairlist!(sym!("a"), sym!("b")));
-//     //println!("result: {:?}", result);
-
-//     // let list = list!(a = 1, b = 2);
-//     // println!("{:?}", list);
-
-//     // let confint1 = R!("confint(lm(weight ~ group - 1, PlantGrowth))").unwrap();
-//     // println!("{:?}", confint1);
-
-//     // assert_eq!(call!("`+`", 1, 2).expect("deu erro"), r!(3));
-
-//     // let formula = lang!("~", sym!(weight), lang!("-", sym!(group), 1.0)).set_class(["formula"]).unwrap();
-//     // let plant_growth = global!(PlantGrowth).unwrap();
-//     // let model = call!("lm", formula, plant_growth).unwrap();
-//     // let confint2 = call!("confint", model).unwrap();
-
-//     // assert_eq!(confint1.as_real_vector(), confint2.as_real_vector());
-
-//     let file = R!("source('../test-function/a.R')");
-//     // only the last one is available
-//     println!("{:?}", file);
-
-//     let func = &file.unwrap().as_list().unwrap().values().collect::<Vec<_>>()[0];
-//     println!("{:?}", func);
-
-//     println!("{:?}", func.call(pairlist!(1, 2)));
-
-//     extendr_engine::end_r();
-//     Ok(())
-// }
+/// Set up the `log` crate.
+fn set_up_logger() -> std::result::Result<(), fern::InitError> {
+    fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "{}[{}][{}] {}",
+                chrono::Local::now().format("[%Y-%m-%d][%H:%M:%S]"),
+                record.target(),
+                record.level(),
+                message
+            ))
+        })
+        .level(log::LevelFilter::Info)
+        .level_for("zenoh", log::LevelFilter::Warn)
+        .level_for("essa_function_executor", log::LevelFilter::Trace)
+        .chain(std::io::stdout())
+        .chain(fern::log_file("function-executor.log")?)
+        .apply()?;
+    Ok(())
+}

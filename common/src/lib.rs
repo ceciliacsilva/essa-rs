@@ -71,3 +71,34 @@ pub fn executor_run_function_topic(
 ) -> String {
     format!("{zenoh_prefix}/executor/{executor_id}/run-function/{module}/{function}/{args}")
 }
+
+/// Subtopic for instructing a `r-executor` to the a `r-function` with
+/// the given `args`.
+pub fn executor_run_r_topic(
+    zenoh_prefix: &str,
+    executor_id: u32,
+    function: &str,
+    args: &str,
+) -> String {
+    format!("{zenoh_prefix}/r-executor/{executor_id}/{function}/{args}")
+}
+
+/// Topic of a given `r-executor` to subscribe to receive
+/// `r-function`s to be ran.
+pub fn executor_run_r_subscribe_topic(zenoh_prefix: &str, executor_id: u32) -> String {
+    format!("{zenoh_prefix}/r-executor/{executor_id}/**")
+}
+
+/// Topic to submit `r-function`s to be schedule.
+pub fn scheduler_run_r_topic(zenoh_prefix: &str) -> String {
+    format!("{zenoh_prefix}/r-run/**")
+}
+
+/// The subtopic for invoking a specific function of a specific module.
+pub fn scheduler_run_r_function_call_topic(
+    zenoh_prefix: &str,
+    function: &str,
+    args: &str,
+) -> String {
+    format!("{zenoh_prefix}/r-run/{function}/{args}",)
+}
