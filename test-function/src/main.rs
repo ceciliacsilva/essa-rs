@@ -16,7 +16,8 @@ fn main() {
     println!("datafusion run: {:?}", serialized_result);
 
     println!("Testing R integration!");
-    let result = essa_api::run_r("function(x) { x$value + c(1,2,3,4) }", &serialized_result).unwrap();
+    let result =
+        essa_api::run_r("function(x) { x$value + c(1,2,3,4) }", &serialized_result).unwrap();
     let serialized_result = result.wait().unwrap();
     println!("Serialized R result: {:?}", serialized_result);
 

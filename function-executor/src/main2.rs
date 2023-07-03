@@ -15,9 +15,9 @@ use zenoh::prelude::r#async::*;
 
 use anna::lattice::Lattice;
 
-use r_polars::{Pairlist, R, eval_string, Conversions};
-use r_polars::polars::prelude::*;
 use polars_sql::SQLContext;
+use r_polars::polars::prelude::*;
+use r_polars::{eval_string, Conversions, Pairlist, R};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -81,13 +81,19 @@ pub async fn datafusion_loop(zenoh: Arc<zenoh::Session>, zenoh_prefix: &str) -> 
                 let delta_table_path = String::from_utf8(delta_table_path)?;
 
                 let mut ctx = SQLContext::new();
-                let table = deltalake::open_table(delta_table_path.clone()).await.unwrap();
+                let table = deltalake::open_table(delta_table_path.clone())
+                    .await
+                    .unwrap();
 
                 println!("{:?}", table.get_files());
 
                 let mut dfs = Vec::new();
                 for file in table.get_files() {
-                    let df = LazyFrame::scan_parquet(format!("{}/{}", delta_table_path, file), Default::default()).unwrap();
+                    let df = LazyFrame::scan_parquet(
+                        format!("{}/{}", delta_table_path, file),
+                        Default::default(),
+                    )
+                    .unwrap();
 
                     let _ = dfs.push(df);
                 }
@@ -97,11 +103,8 @@ pub async fn datafusion_loop(zenoh: Arc<zenoh::Session>, zenoh_prefix: &str) -> 
                 ctx.register("demo", out);
 
                 let sql_query = String::from_utf8(sql_query)?;
-                let result: r_polars::polars::prelude::DataFrame = ctx
-                        .execute(&sql_query)
-                        .unwrap()
-                        .collect()
-                        .unwrap();
+                let result: r_polars::polars::prelude::DataFrame =
+                    ctx.execute(&sql_query).unwrap().collect().unwrap();
 
                 println!("result: {:?}", result);
 
