@@ -12,9 +12,12 @@ use essa_common::{essa_default_zenoh_prefix, executor_run_r_subscribe_topic};
 use extendr_api::deserializer::from_robj;
 use extendr_api::prelude::*;
 use extendr_api::Robj;
+use r_polars::conversion_r_to_s::par_read_robjs;
 use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 use zenoh::prelude::r#async::*;
+
+use std::io::Write;
 
 /// Starts a essa R executor.
 ///
@@ -88,7 +91,7 @@ async fn r_executor(
 
                 let func = kvs_get(func.into(), &mut anna_client)?;
                 let args = kvs_get(args.into(), &mut anna_client)?;
-                let mut serialized_result: Vec<u8> = Vec::new();
+                let mut final_result: Vec<r_polars::polars::prelude::Series> = Vec::new();
 
                 {
                     let func = func
@@ -97,33 +100,38 @@ async fn r_executor(
                         .context("func is not a LWW lattice")?
                         .into_revealed()
                         .into_value();
-                    let args = args
+                    let args_from_anna = args
                         .into_lww()
                         .map_err(eyre_to_anyhow)
                         .context("args is not a LWW lattice")?
                         .into_revealed()
                         .into_value();
 
-                    let args = essa_api::bincode::deserialize(&args);
+                    println!("aqui");
 
-                    let args: essa_common::Rargs = args.unwrap();
-                    let func = String::from_utf8(func)?;
-                    // this is a problem, because there is single_threaded instruction.
-                    let func = eval_string(&func).expect("erro parse");
+                    let result: r_polars::polars::prelude::DataFrame =
+                        bincode::deserialize(&args_from_anna)?;
 
-                    let res: Robj = func
-                        .call(Pairlist::from_pairs(args.args.unwrap()))
-                        .expect("failed to call func");
-                    let res: essa_common::Rreturn = essa_common::Rreturn {
-                        result: from_robj(&res).unwrap(),
-                    };
+                    let rdf: r_polars::rdataframe::DataFrame = result.into();
+                    println!("{:?}", rdf);
 
-                    serialized_result =
-                        essa_api::bincode::serialize(&res).expect("erro serialize res");
+                    let rlist: r_polars::Robj = rdf.to_list_result().unwrap().into();
+                    println!("{:?}", rlist);
+
+                    let function = String::from_utf8(func)?;
+                    let func = eval_string(&function).unwrap();
+                    let result = func.call(Pairlist::from_pairs([("x", rlist)])).unwrap();
+
+                    println!("result: {:?}, type: {:?}", result, result.rtype());
+                    final_result = par_read_robjs(vec![(
+                        r_polars::utils::extendr_concurrent::ParRObj(result),
+                        "result".to_string(),
+                    )])?;
                 }
 
+                let serialize = bincode::serialize(&final_result)?;
                 query
-                    .reply(Ok(Sample::new(query.key_expr().clone(), serialized_result)))
+                    .reply(Ok(Sample::new(query.key_expr().clone(), serialize)))
                     .res()
                     .await
                     .expect("failed to send sample back");

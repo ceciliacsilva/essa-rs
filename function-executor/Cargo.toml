@@ -25,8 +25,20 @@ uuid = {version = "0.8.2", features = ["v4"]}
 zenoh = "0.7.0-rc"
 tokio = { version = "1.28", features = ["rt-multi-thread", "macros"] }
 flume = "0.10"
+deltalake = { version = "0.12.0" }
+r_polars = { path = "/home/ceciliacsilva/external-projects/r-polars/src/rust" }
+polars-sql = { git = "https://github.com/pola-rs/polars.git", rev = "e973f6386a28f16136fb8ba5a737103f95911861"}
+
 
 [features]
 default = ["wasmtime_executor"]
 wasmedge_executor = ["wasmedge-sdk"]
 wasmtime_executor = ["wasmtime", "wasmtime-wasi"]
+
+[[bin]]
+name = "datafusion"
+path = "src/main2.rs"
+
+[[bin]]
+name = "main"
+path = "src/main.rs"

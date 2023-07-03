@@ -10,7 +10,7 @@ use crate::c_api::{
     essa_set_result,
 };
 use anna_api::{ClientKey, LatticeValue};
-use c_api::{essa_call, essa_get_result, essa_get_result_len};
+use c_api::{essa_call, essa_datafusion_run, essa_get_result, essa_get_result_len};
 
 /// Re-export the dependencies on serde and bincode to allow downstream
 /// crates to use the exact same version.
@@ -102,6 +102,25 @@ pub fn run_r(function: &str, args: &[u8]) -> Result<ResultHandle, EssaResult> {
             function.len(),
             args.as_ptr(),
             args.len(),
+            &mut result_handle,
+        )
+    };
+
+    match result {
+        i if i == EssaResult::Ok as i32 => Ok(ResultHandle(result_handle)),
+        other => return Err(other.try_into().unwrap()),
+    }
+}
+
+/// Involkes the given `query` into a `deltalake` using `Datafusion`.
+pub fn datafusion_run(sql_query: &str, table: &str) -> Result<ResultHandle, EssaResult> {
+    let mut result_handle = 0;
+    let result = unsafe {
+        essa_datafusion_run(
+            sql_query.as_ptr(),
+            sql_query.len(),
+            table.as_ptr(),
+            table.len(),
             &mut result_handle,
         )
     };

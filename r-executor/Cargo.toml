@@ -11,8 +11,11 @@ essa-common = {path = "../common"}
 essa-api = { path = "../api" }
 argh = "0.1.6"
 zenoh = "0.7.0-rc"
-extendr-api = {version = "0.4", features = ["serde"]}
-extendr-engine = "0.4"
+extendr-api = { git = "https://github.com/rpolars/extendr", branch = "pr473_553_555_566", default-features = false, features = [
+  "result_list",
+  "serde",
+] }
+extendr-engine = { git = "https://github.com/rpolars/extendr", branch = "pr473_553_555_566" }
 anyhow = "1.0.45"
 fern = "0.6.0"
 chrono = {version = "0.4.19", default-features = false}
@@ -23,4 +26,5 @@ tokio = { version = "1.28", features = ["rt-multi-thread", "macros"] }
 flume = "0.10"
 eyre = "0.6.5"
 serde = {version = "1.0", features = ["derive"]}
-serde_json = "1.0"
+r_polars = { path = "/home/ceciliacsilva/external-projects/r-polars/src/rust" }
+bincode = "1.3.3"

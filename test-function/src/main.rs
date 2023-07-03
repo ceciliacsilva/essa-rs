@@ -1,87 +1,88 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 
 use anna_api::lattice::{Lattice, SetLattice};
-use anyhow::Context;
 use essa_test_function::{
     append_foo, concurrent_kvs_test_extern, repeat_string_extern, to_uppercase_extern,
 };
 
 fn main() {
+    let a = essa_api::datafusion_run(
+        "SELECT * FROM demo",
+        "/home/ceciliacsilva/external-projects/delta-rs/rust/tests/data/delta-0.8.0",
+    )
+    .unwrap();
+
+    let serialized_result = a.wait().unwrap();
+    println!("datafusion run: {:?}", serialized_result);
+
     println!("Testing R integration!");
-    let args = essa_common::Rargs {
-        args: Some(vec![
-            ("x".to_string(), vec![2.0, 4.0]),
-            ("y".to_string(), vec![4.0, 3.0]),
-        ]),
-    };
-    let args = essa_api::bincode::serialize(&args).expect("error at serialize args");
-    let result = essa_api::run_r("function(x,y){x*y}", &args).unwrap();
+    let result = essa_api::run_r("function(x) { x$value + c(1,2,3,4) }", &serialized_result).unwrap();
     let serialized_result = result.wait().unwrap();
     println!("Serialized R result: {:?}", serialized_result);
-    let result: Result<essa_common::Rreturn, Box<bincode::ErrorKind>> =
-        essa_api::bincode::deserialize(&serialized_result);
-    println!("Result from R: {:?}", result);
 
-    println!("Hello world from test function!");
-    let result = to_uppercase_extern("foobar".into()).expect("extern function call failed");
-    println!("Waiting for result...");
-    let result = result.get().unwrap();
-    println!("Function result: {:?}", result);
+    let result = essa_api::run_r("function(x) { x }", &serialized_result).unwrap();
+    let _serialized_result = result.wait().unwrap();
 
-    println!("Storing a set in the kvs");
-    let key = "some-test-key".into();
-    essa_api::kvs_put(
-        &key,
-        &SetLattice::new(["one".into(), "two".into(), "three".into()].into()).into(),
-    )
-    .unwrap();
+    // println!("Hello world from test function!");
+    // let result = to_uppercase_extern("foobar".into()).expect("extern function call failed");
+    // println!("Waiting for result...");
+    // let result = result.get().unwrap();
+    // println!("Function result: {:?}", result);
 
-    let result = append_foo(result).expect("extern function call failed");
-    println!("Waiting for result...");
-    let result = result.get().unwrap();
-    println!("Function result: {}", result);
+    // println!("Storing a set in the kvs");
+    // let key = "some-test-key".into();
+    // essa_api::kvs_put(
+    //     &key,
+    //     &SetLattice::new(["one".into(), "two".into(), "three".into()].into()).into(),
+    // )
+    // .unwrap();
 
-    println!("Reading the set from the kvs");
-    let lattice = essa_api::kvs_get(&key)
-        .unwrap()
-        .into_set()
-        .unwrap()
-        .into_revealed();
-    println!(
-        "Result: {:?}",
-        lattice
-            .iter()
-            .map(|v| std::str::from_utf8(v))
-            .collect::<Result<HashSet<_>, _>>()
-            .unwrap()
-    );
+    // let result = append_foo(result).expect("extern function call failed");
+    // println!("Waiting for result...");
+    // let result = result.get().unwrap();
+    // println!("Function result: {}", result);
 
-    println!("Appending to the set in the kvs");
-    essa_api::kvs_put(
-        &key,
-        &SetLattice::new(["four".into(), "two".into(), "three".into()].into()).into(),
-    )
-    .unwrap();
+    // println!("Reading the set from the kvs");
+    // let lattice = essa_api::kvs_get(&key)
+    //     .unwrap()
+    //     .into_set()
+    //     .unwrap()
+    //     .into_revealed();
+    // println!(
+    //     "Result: {:?}",
+    //     lattice
+    //         .iter()
+    //         .map(|v| std::str::from_utf8(v))
+    //         .collect::<Result<HashSet<_>, _>>()
+    //         .unwrap()
+    // );
 
-    let result = repeat_string_extern(result, 15000).expect("extern function call failed");
-    println!("Waiting for result...");
-    let result = result.get().unwrap();
-    println!("Function result: {}", result.len());
+    // println!("Appending to the set in the kvs");
+    // essa_api::kvs_put(
+    //     &key,
+    //     &SetLattice::new(["four".into(), "two".into(), "three".into()].into()).into(),
+    // )
+    // .unwrap();
 
-    println!("Reading the set from the kvs");
-    let lattice = essa_api::kvs_get(&key)
-        .unwrap()
-        .into_set()
-        .unwrap()
-        .into_revealed();
-    println!(
-        "Result: {:?}",
-        lattice
-            .iter()
-            .map(|v| std::str::from_utf8(v))
-            .collect::<Result<HashSet<_>, _>>()
-            .unwrap()
-    );
+    // let result = repeat_string_extern(result, 15000).expect("extern function call failed");
+    // println!("Waiting for result...");
+    // let result = result.get().unwrap();
+    // println!("Function result: {}", result.len());
+
+    // println!("Reading the set from the kvs");
+    // let lattice = essa_api::kvs_get(&key)
+    //     .unwrap()
+    //     .into_set()
+    //     .unwrap()
+    //     .into_revealed();
+    // println!(
+    //     "Result: {:?}",
+    //     lattice
+    //         .iter()
+    //         .map(|v| std::str::from_utf8(v))
+    //         .collect::<Result<HashSet<_>, _>>()
+    //         .unwrap()
+    // );
 
     // // TODO: this is not working right now. Should be fixed.
     // println!("Running concurrent KVS test");
@@ -108,6 +109,5 @@ fn main() {
     //     .collect::<Result<BTreeSet<_>, _>>()
     //     .unwrap();
     // assert_eq!(result_set, (range_start..range_end).collect());
-
     println!("DONE");
 }

@@ -202,7 +202,7 @@ extern "C" {
         value_len_ptr: *mut usize,
     ) -> i32;
 }
-// R related functionality
+
 #[link(wasm_import_module = "host")]
 extern "C" {
     /// Run a remote R function.
@@ -212,5 +212,18 @@ extern "C" {
         args_ptr: *const u8,
         args_len: usize,
         result_handle: *mut usize,
+    ) -> i32;
+}
+
+#[link(wasm_import_module = "host")]
+extern "C" {
+    /// Run a `query` to `deltalake` using
+    /// `Datafusion`.
+    pub fn essa_datafusion_run(
+        sql_query_ptr: *const u8,
+        sql_query_len: usize,
+        delta_table_ptr: *const u8,
+        delta_table_len: usize,
+        result_handler: *mut usize,
     ) -> i32;
 }

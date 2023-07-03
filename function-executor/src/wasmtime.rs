@@ -8,10 +8,12 @@ use crate::{get_args, get_module, kvs_get, kvs_put, EssaResult, FunctionExecutor
 use anna::{lattice::LastWriterWinsLattice, nodes::ClientNode, ClientKey};
 use anyhow::{bail, Context};
 use essa_common::{scheduler_function_call_topic, scheduler_run_r_function_call_topic};
+use flume::Receiver;
 use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
 use wasmtime::{Caller, Engine, Extern, Linker, Module, Store, ValType};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder};
+use zenoh::query;
 use zenoh::{prelude::r#async::*, query::Reply, queryable::Query};
 
 impl FunctionExecutor {
@@ -255,6 +257,29 @@ fn set_up_module(
     linker
         .func_wrap(
             "host",
+            "essa_datafusion_run",
+            |caller: Caller<'_, HostState>,
+             sql_query_ptr: u32,
+             sql_query_len: u32,
+             delta_table_ptr: u32,
+             delta_table_len: u32,
+             result_handle_ptr: u32| {
+                essa_datafusion_run_wrapper(
+                    caller,
+                    sql_query_ptr,
+                    sql_query_len,
+                    delta_table_ptr,
+                    delta_table_len,
+                    result_handle_ptr,
+                )
+                .map(|r| r as i32)
+            },
+        )
+        .context("failed to create essa_run_r host function")?;
+
+    linker
+        .func_wrap(
+            "host",
             "essa_get_result_len",
             |caller: Caller<'_, HostState>, handle: u32, value_len_ptr: u32| {
                 essa_get_result_len_wrapper(caller, handle, value_len_ptr).map(|r| r as i32)
@@ -418,6 +443,60 @@ fn essa_run_r_wrapper(
     };
 
     match caller.data_mut().essa_run_r(function, args) {
+        Ok(result) => {
+            let host_state = caller.data_mut();
+            let handle = host_state.next_result_handle;
+            host_state.next_result_handle += 1;
+            host_state.result_receivers.insert(handle, result);
+
+            // write handle
+            mem.write(
+                &mut caller,
+                result_handle_ptr as usize,
+                &handle.to_le_bytes(),
+            )
+            .context("result_handle_ptr out of bounds")?;
+
+            Ok(EssaResult::Ok)
+        }
+        Err(err) => Ok(err),
+    }
+}
+
+/// Host function for running a `Datafusion` query to a `Deltalake`.
+fn essa_datafusion_run_wrapper(
+    mut caller: Caller<HostState>,
+    sql_query_ptr: u32,
+    sql_query_len: u32,
+    delta_table_ptr: u32,
+    delta_table_len: u32,
+    result_handle_ptr: u32,
+) -> anyhow::Result<EssaResult> {
+    // Use our `caller` context to get the memory export of the
+    // module which called this host sql_query.
+    let mem = match caller.get_export("memory") {
+        Some(Extern::Memory(mem)) => mem,
+        _ => bail!("failed to find host memory"),
+    };
+    // read the sql_query name from the WASM sandbox
+    let sql_query = {
+        let mut data = vec![0u8; sql_query_len as usize];
+        mem.read(&caller, sql_query_ptr as usize, &mut data)
+            .context("sql_query ptr/len out of bounds")?;
+        String::from_utf8(data).context("sql_query name not valid utf8")?
+    };
+    // read the serialized sql_query arguments from the WASM sandbox
+    let delta_table = {
+        let mut data = vec![0u8; delta_table_len as usize];
+        mem.read(&caller, delta_table_ptr as usize, &mut data)
+            .context("sql_query args ptr/len out of bounds")?;
+        String::from_utf8(data).context("delta_table name not valid utf8")?
+    };
+
+    match caller
+        .data_mut()
+        .essa_datafusion_run(sql_query, delta_table)
+    {
         Ok(result) => {
             let host_state = caller.data_mut();
             let handle = host_state.next_result_handle;
@@ -745,6 +824,42 @@ impl HostState {
         Ok(reply)
     }
 
+    /// Calls the given function on a node and returns the reply receiver for
+    /// the corresponding result.
+    fn essa_datafusion_run(
+        &mut self,
+        sql_query: String,
+        delta_table: String,
+    ) -> Result<flume::Receiver<Reply>, EssaResult> {
+        let sql_query_key: ClientKey = Uuid::new_v4().to_string().into();
+        kvs_put(
+            sql_query_key.clone(),
+            LastWriterWinsLattice::new_now(sql_query.as_bytes().into()).into(),
+            &mut self.anna,
+        )
+        .map_err(|_| EssaResult::UnknownError)?;
+
+        // store args in kvs
+        let delta_table_key: ClientKey = Uuid::new_v4().to_string().into();
+        kvs_put(
+            delta_table_key.clone(),
+            LastWriterWinsLattice::new_now(delta_table.as_bytes().into()).into(),
+            &mut self.anna,
+        )
+        .map_err(|_| EssaResult::UnknownError)?;
+
+        // trigger the function call on a remote node
+        let reply = smol::block_on(datafusion_run_extern(
+            sql_query_key,
+            delta_table_key,
+            self.zenoh.clone(),
+            &self.zenoh_prefix,
+        ))
+        .unwrap();
+
+        Ok(reply)
+    }
+
     /// Stores the given serialized `LattiveValue` in the KVS.
     fn put_lattice(&mut self, key: &ClientKey, value: &[u8]) -> Result<(), EssaResult> {
         let value = bincode::deserialize(value).map_err(|_| EssaResult::UnknownError)?;
@@ -771,6 +886,9 @@ impl HostState {
                         log::debug!("Error get_result, recv_async: {e:?}");
                         EssaResult::UnknownError
                     })?;
+
+                    println!("reply: {reply:?}");
+
                     let value = reply
                         .sample
                         .map_err(|_e| EssaResult::UnknownError)?
@@ -778,6 +896,8 @@ impl HostState {
                         .payload
                         .contiguous()
                         .into_owned();
+
+                    println!("value: {value:?}");
                     let value = entry.insert(Arc::new(value));
                     Ok(value.clone())
                 } else {
@@ -829,6 +949,24 @@ async fn run_r_extern(
         .await
         .map_err(|e| anyhow::anyhow!(e))
         .context("failed to send function call request to scheduler")?;
+
+    Ok(reply)
+}
+
+async fn datafusion_run_extern(
+    sql_query_key: ClientKey,
+    delta_table_key: ClientKey,
+    zenoh: Arc<zenoh::Session>,
+    zenoh_prefix: &str,
+) -> anyhow::Result<Receiver<Reply>> {
+    let topic = format!("essa/datafusion/{sql_query_key}/{delta_table_key}");
+
+    let reply = zenoh
+        .get(topic)
+        .res()
+        .await
+        .map_err(|e| anyhow::anyhow!(e))
+        .context("failed datafusion")?;
 
     Ok(reply)
 }
