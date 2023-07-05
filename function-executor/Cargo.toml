@@ -36,8 +36,8 @@ wasmedge_executor = ["wasmedge-sdk"]
 wasmtime_executor = ["wasmtime", "wasmtime-wasi"]
 
 [[bin]]
-name = "datafusion"
-path = "src/main2.rs"
+name = "deltalake"
+path = "src/deltalake.rs"
 
 [[bin]]
 name = "main"

@@ -7,7 +7,6 @@ use anna::{
 };
 use anyhow::Context;
 use essa_common::essa_default_zenoh_prefix;
-use serde::Deserialize;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -17,7 +16,6 @@ use anna::lattice::Lattice;
 
 use polars_sql::SQLContext;
 use r_polars::polars::prelude::*;
-use r_polars::{eval_string, Conversions, Pairlist, R};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -31,13 +29,13 @@ async fn main() -> anyhow::Result<()> {
 
     let zenoh_prefix = essa_default_zenoh_prefix().to_owned();
 
-    let _ = datafusion_loop(zenoh, &zenoh_prefix).await;
+    let _ = polars_loop(zenoh, &zenoh_prefix).await;
 
     Ok(())
 }
 
-pub async fn datafusion_loop(zenoh: Arc<zenoh::Session>, zenoh_prefix: &str) -> anyhow::Result<()> {
-    println!("loop datafusion");
+pub async fn polars_loop(zenoh: Arc<zenoh::Session>, _zenoh_prefix: &str) -> anyhow::Result<()> {
+    log::info!("Stating `polars` deltalake executor");
     let topic = "essa/datafusion/*/*";
 
     let reply = zenoh
@@ -52,7 +50,6 @@ pub async fn datafusion_loop(zenoh: Arc<zenoh::Session>, zenoh_prefix: &str) -> 
     loop {
         match reply.recv_async().await {
             Ok(query) => {
-                println!("quando eu recebo algo?");
                 let mut topic_split = query.key_expr().as_str().split('/');
                 let delta_table_key: String = topic_split
                     .next_back()
@@ -100,13 +97,14 @@ pub async fn datafusion_loop(zenoh: Arc<zenoh::Session>, zenoh_prefix: &str) -> 
 
                 let out = diag_concat_lf(&dfs, false, false)?;
 
+                // XXX: has to be `table` name
                 ctx.register("demo", out);
 
                 let sql_query = String::from_utf8(sql_query)?;
                 let result: r_polars::polars::prelude::DataFrame =
                     ctx.execute(&sql_query).unwrap().collect().unwrap();
 
-                println!("result: {:?}", result);
+                log::debug!("SQL execute result: {:?}", result);
 
                 let serialized_result = bincode::serialize(&result)?;
 
@@ -115,10 +113,10 @@ pub async fn datafusion_loop(zenoh: Arc<zenoh::Session>, zenoh_prefix: &str) -> 
                     .res()
                     .await
                     .expect("failed to send sample back");
-                println!("sending result back");
+                log::info("Sending result back");
             }
             Err(e) => {
-                log::debug!("zenoh error {e:?}");
+                log::info!("zenoh error {e:?}");
                 break;
             }
         }

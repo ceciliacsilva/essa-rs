@@ -13,5 +13,3 @@ bincode = "1.3.3"
 essa-api = { path = "../api" }
 essa-common = { path = "../common" }
 anna-api = { path = "../anna-rs/api" }
-
-#polars = { git = "https://github.com/pola-rs/polars.git", rev = "e973f6386a28f16136fb8ba5a737103f95911861" }

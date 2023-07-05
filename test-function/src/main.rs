@@ -24,66 +24,66 @@ fn main() {
     let result = essa_api::run_r("function(x) { x }", &serialized_result).unwrap();
     let _serialized_result = result.wait().unwrap();
 
-    // println!("Hello world from test function!");
-    // let result = to_uppercase_extern("foobar".into()).expect("extern function call failed");
-    // println!("Waiting for result...");
-    // let result = result.get().unwrap();
-    // println!("Function result: {:?}", result);
+    println!("Hello world from test function!");
+    let result = to_uppercase_extern("foobar".into()).expect("extern function call failed");
+    println!("Waiting for result...");
+    let result = result.get().unwrap();
+    println!("Function result: {:?}", result);
 
-    // println!("Storing a set in the kvs");
-    // let key = "some-test-key".into();
-    // essa_api::kvs_put(
-    //     &key,
-    //     &SetLattice::new(["one".into(), "two".into(), "three".into()].into()).into(),
-    // )
-    // .unwrap();
+    println!("Storing a set in the kvs");
+    let key = "some-test-key".into();
+    essa_api::kvs_put(
+        &key,
+        &SetLattice::new(["one".into(), "two".into(), "three".into()].into()).into(),
+    )
+    .unwrap();
 
-    // let result = append_foo(result).expect("extern function call failed");
-    // println!("Waiting for result...");
-    // let result = result.get().unwrap();
-    // println!("Function result: {}", result);
+    let result = append_foo(result).expect("extern function call failed");
+    println!("Waiting for result...");
+    let result = result.get().unwrap();
+    println!("Function result: {}", result);
 
-    // println!("Reading the set from the kvs");
-    // let lattice = essa_api::kvs_get(&key)
-    //     .unwrap()
-    //     .into_set()
-    //     .unwrap()
-    //     .into_revealed();
-    // println!(
-    //     "Result: {:?}",
-    //     lattice
-    //         .iter()
-    //         .map(|v| std::str::from_utf8(v))
-    //         .collect::<Result<HashSet<_>, _>>()
-    //         .unwrap()
-    // );
+    println!("Reading the set from the kvs");
+    let lattice = essa_api::kvs_get(&key)
+        .unwrap()
+        .into_set()
+        .unwrap()
+        .into_revealed();
+    println!(
+        "Result: {:?}",
+        lattice
+            .iter()
+            .map(|v| std::str::from_utf8(v))
+            .collect::<Result<HashSet<_>, _>>()
+            .unwrap()
+    );
 
-    // println!("Appending to the set in the kvs");
-    // essa_api::kvs_put(
-    //     &key,
-    //     &SetLattice::new(["four".into(), "two".into(), "three".into()].into()).into(),
-    // )
-    // .unwrap();
+    println!("Appending to the set in the kvs");
+    essa_api::kvs_put(
+        &key,
+        &SetLattice::new(["four".into(), "two".into(), "three".into()].into()).into(),
+    )
+    .unwrap();
 
-    // let result = repeat_string_extern(result, 15000).expect("extern function call failed");
-    // println!("Waiting for result...");
-    // let result = result.get().unwrap();
-    // println!("Function result: {}", result.len());
+    let result = repeat_string_extern(result, 15000).expect("extern function call failed");
+    println!("Waiting for result...");
+    let result = result.get().unwrap();
+    println!("Function result: {}", result.len());
 
-    // println!("Reading the set from the kvs");
-    // let lattice = essa_api::kvs_get(&key)
-    //     .unwrap()
-    //     .into_set()
-    //     .unwrap()
-    //     .into_revealed();
-    // println!(
-    //     "Result: {:?}",
-    //     lattice
-    //         .iter()
-    //         .map(|v| std::str::from_utf8(v))
-    //         .collect::<Result<HashSet<_>, _>>()
-    //         .unwrap()
-    // );
+    println!("Reading the set from the kvs");
+    let lattice = essa_api::kvs_get(&key)
+        .unwrap()
+        .into_set()
+        .unwrap()
+        .into_revealed();
+    println!(
+        "Result: {:?}",
+        lattice
+            .iter()
+            .map(|v| std::str::from_utf8(v))
+            .collect::<Result<HashSet<_>, _>>()
+            .unwrap()
+    );
 
     // // TODO: this is not working right now. Should be fixed.
     // println!("Running concurrent KVS test");

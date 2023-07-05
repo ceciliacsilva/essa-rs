@@ -13,7 +13,6 @@ use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
 use wasmtime::{Caller, Engine, Extern, Linker, Module, Store, ValType};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder};
-use zenoh::query;
 use zenoh::{prelude::r#async::*, query::Reply, queryable::Query};
 
 impl FunctionExecutor {
