@@ -107,26 +107,53 @@ async fn r_executor(
                         .into_revealed()
                         .into_value();
 
-                    println!("aqui");
-
                     let result: r_polars::polars::prelude::DataFrame =
                         bincode::deserialize(&args_from_anna)?;
 
                     let rdf: r_polars::rdataframe::DataFrame = result.into();
-                    println!("{:?}", rdf);
+                    println!("dataframe: {:?}", rdf);
 
                     let rlist: r_polars::Robj = rdf.to_list_result().unwrap().into();
-                    println!("{:?}", rlist);
 
                     let function = String::from_utf8(func)?;
-                    let func = eval_string(&function).unwrap();
-                    let result = func.call(Pairlist::from_pairs([("x", rlist)])).unwrap();
+                    let func: Robj = eval_string(&function).unwrap();
+                    let arguments = func.as_function().expect("not a function").formals();
 
-                    println!("result: {:?}, type: {:?}", result, result.rtype());
-                    final_result = par_read_robjs(vec![(
-                        r_polars::utils::extendr_concurrent::ParRObj(result),
-                        "result".to_string(),
-                    )])?;
+                    let mut arguments_pairlist: Vec<(&str, Robj)> = vec![];
+                    match arguments {
+                        Some(args) => {
+                            if let Some(name) = args.names().next() {
+                                arguments_pairlist.push((name, rlist));
+                            }
+                        }
+                        None => {
+                            println!("no args");
+                        }
+                    }
+
+                    let result = func.call(Pairlist::from_pairs(arguments_pairlist)).unwrap();
+
+                    let mut results = result.as_real_slice().unwrap().chunks_exact(result.len());
+                    if let Some(dim) = result.dim() {
+                        match dim.iter().collect::<Vec<_>>().as_slice() {
+                            &[line, col] => {
+                                results =
+                                    result.as_real_slice().unwrap().chunks_exact(col.0 as usize)
+                            }
+                            _ => (),
+                        }
+                    };
+
+                    let mut par_objs = vec![];
+
+                    for (i, result) in results.enumerate() {
+                        par_objs.push((
+                            r_polars::utils::extendr_concurrent::ParRObj(result.into()),
+                            i.to_string(),
+                        ));
+                    }
+
+                    final_result = par_read_robjs(par_objs)?;
                 }
 
                 let serialize = bincode::serialize(&final_result)?;

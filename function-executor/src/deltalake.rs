@@ -97,8 +97,8 @@ pub async fn polars_loop(zenoh: Arc<zenoh::Session>, _zenoh_prefix: &str) -> any
 
                 let out = diag_concat_lf(&dfs, false, false)?;
 
-                // XXX: has to be `table` name
-                ctx.register("demo", out);
+                // TODO: has to be `table` name, comming from query.
+                ctx.register("aquisicoes", out);
 
                 let sql_query = String::from_utf8(sql_query)?;
                 let result: r_polars::polars::prelude::DataFrame =
@@ -113,7 +113,7 @@ pub async fn polars_loop(zenoh: Arc<zenoh::Session>, _zenoh_prefix: &str) -> any
                     .res()
                     .await
                     .expect("failed to send sample back");
-                log::info("Sending result back");
+                log::info!("Sending result back");
             }
             Err(e) => {
                 log::info!("zenoh error {e:?}");

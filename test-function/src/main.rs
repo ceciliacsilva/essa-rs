@@ -6,23 +6,54 @@ use essa_test_function::{
 };
 
 fn main() {
-    let a = essa_api::datafusion_run(
-        "SELECT * FROM demo",
-        "/home/ceciliacsilva/external-projects/delta-rs/rust/tests/data/delta-0.8.0",
+    let to_get_acquisitions = essa_api::datafusion_run(
+        "SELECT frequencia, resistencia, temperatura FROM aquisicoes",
+        "/home/ceciliacsilva/Desktop/delta-rs/shm",
     )
     .unwrap();
 
-    let serialized_result = a.wait().unwrap();
-    println!("datafusion run: {:?}", serialized_result);
+    let acquisitions = to_get_acquisitions.wait().unwrap();
 
     println!("Testing R integration!");
-    let result =
-        essa_api::run_r("function(x) { x$value + c(1,2,3,4) }", &serialized_result).unwrap();
-    let serialized_result = result.wait().unwrap();
-    println!("Serialized R result: {:?}", serialized_result);
 
-    let result = essa_api::run_r("function(x) { x }", &serialized_result).unwrap();
-    let _serialized_result = result.wait().unwrap();
+    let to_measures = essa_api::run_r(
+        r#"function(pzt_batch_measures){
+  impedance_r <- pzt_batch_measures$resistencia
+  frequency_points <- pzt_batch_measures$frequencia[[1]]
+
+  batch_size <- length(impedance_r)
+  frequency_points_qnt <- length(frequency_points)
+
+  measure_matrix <- matrix(NA, frequency_points_qnt, batch_size)
+
+  for(i in 1:batch_size){
+    measure_matrix[,i]<-impedance_r[[i]]
+  }
+  return(measure_matrix)
+}"#,
+        &acquisitions,
+    )
+    .unwrap();
+
+    let measures_df = to_measures.wait().unwrap();
+
+    let to_median_impedance = essa_api::run_r(
+        r#"function(measure_df){
+  measure_matrix = matrix(unlist(measure_df), ncol=2)
+  median_impedance_r = vector()
+  batch_size <- ncol(measure_matrix)
+  frequency_points_qnt <- nrow(measure_matrix)
+
+  for(i in 1:frequency_points_qnt){
+    median_impedance_r[i]=median(as.numeric(measure_matrix[i,1:batch_size]))
+  }
+
+  return(median_impedance_r)
+}"#,
+        &measures_df,
+    )
+    .unwrap();
+    let _median_impedance_r = to_median_impedance.wait().unwrap();
 
     println!("Hello world from test function!");
     let result = to_uppercase_extern("foobar".into()).expect("extern function call failed");
