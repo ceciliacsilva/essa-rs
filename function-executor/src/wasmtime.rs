@@ -9,7 +9,7 @@ use anna::{lattice::LastWriterWinsLattice, nodes::ClientNode, ClientKey};
 use anyhow::{bail, Context};
 use essa_common::{scheduler_function_call_topic, scheduler_run_r_function_call_topic};
 use flume::Receiver;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, ops::Deref};
 use uuid::Uuid;
 use wasmtime::{Caller, Engine, Extern, Linker, Module, Store, ValType};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder};
@@ -275,7 +275,26 @@ fn set_up_module(
             },
         )
         .context("failed to create essa_run_r host function")?;
-
+    linker
+        .func_wrap(
+            "host",
+            "essa_deltalake_save",
+            |caller: Caller<'_, HostState>,
+             table_path_ptr: u32,
+             table_path_len: u32,
+             dataframe_result_handler: u32,
+             result_handle_ptr: u32| {
+                essa_deltalake_save_wrapper(
+                    caller,
+                    table_path_ptr,
+                    table_path_len,
+                    dataframe_result_handler,
+                    result_handle_ptr,
+                )
+                .map(|r| r as i32)
+            },
+        )
+        .context("failed to create essa_run_r host function")?;
     linker
         .func_wrap(
             "host",
@@ -516,6 +535,52 @@ fn essa_datafusion_run_wrapper(
     }
 }
 
+/// Host function for running a `Datafusion` query to a `Deltalake`.
+fn essa_deltalake_save_wrapper(
+    mut caller: Caller<HostState>,
+    table_path_ptr: u32,
+    table_path_len: u32,
+    dataframe_handler: u32,
+    result_handle_ptr: u32,
+) -> anyhow::Result<EssaResult> {
+    // Use our `caller` context to get the memory export of the
+    // module which called this host sql_query.
+    let mem = match caller.get_export("memory") {
+        Some(Extern::Memory(mem)) => mem,
+        _ => bail!("failed to find host memory"),
+    };
+    // read the sql_query name from the WASM sandbox
+    let table_path = {
+        let mut data = vec![0u8; table_path_len as usize];
+        mem.read(&caller, table_path_ptr as usize, &mut data)
+            .context("sql_query ptr/len out of bounds")?;
+        String::from_utf8(data).context("sql_query name not valid utf8")?
+    };
+
+    match caller
+        .data_mut()
+        .essa_deltalake_save(table_path, dataframe_handler)
+    {
+        Ok(result) => {
+            let host_state = caller.data_mut();
+            let handle = host_state.next_result_handle;
+            host_state.next_result_handle += 1;
+            host_state.result_receivers.insert(handle, result);
+
+            // write handle
+            mem.write(
+                &mut caller,
+                result_handle_ptr as usize,
+                &handle.to_le_bytes(),
+            )
+            .context("result_handle_ptr out of bounds")?;
+
+            Ok(EssaResult::Ok)
+        }
+        Err(err) => Ok(err),
+    }
+}
+
 fn essa_get_result_len_wrapper(
     mut caller: Caller<HostState>,
     handle: u32,
@@ -565,6 +630,7 @@ fn essa_get_result_wrapper(
         _ => bail!("failed to find host memory"),
     };
 
+    println!("handler: {:?}", handle);
     // get the corresponding value from the KVS
     match smol::block_on(caller.data_mut().get_result(handle)) {
         Ok(value) => {
@@ -859,6 +925,45 @@ impl HostState {
         Ok(reply)
     }
 
+    /// Calls the given function on a node and returns the reply receiver for
+    /// the corresponding result.
+    fn essa_deltalake_save(
+        &mut self,
+        table_path: String,
+        dataframe_handle: u32,
+    ) -> Result<flume::Receiver<Reply>, EssaResult> {
+        let table_path_key: ClientKey = Uuid::new_v4().to_string().into();
+        kvs_put(
+            table_path_key.clone(),
+            LastWriterWinsLattice::new_now(table_path.as_bytes().into()).into(),
+            &mut self.anna,
+        )
+        .map_err(|_| EssaResult::UnknownError)?;
+
+        let dataframe = smol::block_on(self.get_result(dataframe_handle))?;
+        let dataframe_key: ClientKey = Uuid::new_v4().to_string().into();
+        // TODO: could this be better?
+        let dataframe = unsafe { &*Arc::into_raw(dataframe.clone()) }.clone();
+        kvs_put(
+            dataframe_key.clone(),
+            // TODO: this could be better
+            LastWriterWinsLattice::new_now(dataframe).into(),
+            &mut self.anna,
+        )
+        .map_err(|_| EssaResult::UnknownError)?;
+
+        // trigger the function call on a remote node
+        let reply = smol::block_on(deltalake_save_extern(
+            table_path_key,
+            dataframe_key,
+            self.zenoh.clone(),
+            &self.zenoh_prefix,
+        ))
+        .unwrap();
+
+        Ok(reply)
+    }
+
     /// Stores the given serialized `LattiveValue` in the KVS.
     fn put_lattice(&mut self, key: &ClientKey, value: &[u8]) -> Result<(), EssaResult> {
         let value = bincode::deserialize(value).map_err(|_| EssaResult::UnknownError)?;
@@ -886,7 +991,7 @@ impl HostState {
                         EssaResult::UnknownError
                     })?;
 
-                    println!("reply: {reply:?}");
+                    //println!("reply: {reply:?}");
 
                     let value = reply
                         .sample
@@ -896,7 +1001,7 @@ impl HostState {
                         .contiguous()
                         .into_owned();
 
-                    println!("value: {value:?}");
+                    //println!("value: {value:?}");
                     let value = entry.insert(Arc::new(value));
                     Ok(value.clone())
                 } else {
@@ -966,6 +1071,24 @@ async fn datafusion_run_extern(
         .await
         .map_err(|e| anyhow::anyhow!(e))
         .context("failed datafusion")?;
+
+    Ok(reply)
+}
+
+async fn deltalake_save_extern(
+    table_path_key: ClientKey,
+    dataframe_key: ClientKey,
+    zenoh: Arc<zenoh::Session>,
+    zenoh_prefix: &str,
+) -> anyhow::Result<Receiver<Reply>> {
+    let topic = format!("essa/save-deltalake/{table_path_key}/{dataframe_key}");
+
+    let reply = zenoh
+        .get(topic)
+        .res()
+        .await
+        .map_err(|e| anyhow::anyhow!(e))
+        .context("failed save deltalake")?;
 
     Ok(reply)
 }

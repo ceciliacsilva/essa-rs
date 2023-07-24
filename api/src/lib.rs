@@ -10,7 +10,7 @@ use crate::c_api::{
     essa_set_result,
 };
 use anna_api::{ClientKey, LatticeValue};
-use c_api::{essa_call, essa_datafusion_run, essa_get_result, essa_get_result_len};
+use c_api::{essa_call, essa_datafusion_run, essa_get_result, essa_get_result_len, essa_deltalake_save};
 
 /// Re-export the dependencies on serde and bincode to allow downstream
 /// crates to use the exact same version.
@@ -131,11 +131,29 @@ pub fn datafusion_run(sql_query: &str, table: &str) -> Result<ResultHandle, Essa
     }
 }
 
+/// Involkes save to `deltalake` the given `dataframe`.
+pub fn deltalake_save(table_path: &str, result_handler: usize) -> Result<ResultHandle, EssaResult> {
+    let mut result_handle = 0;
+    let result = unsafe {
+        essa_deltalake_save(
+            table_path.as_ptr(),
+            table_path.len(),
+            result_handler,
+            &mut result_handle,
+        )
+    };
+
+    match result {
+        i if i == EssaResult::Ok as i32 => Ok(ResultHandle(result_handle)),
+        other => return Err(other.try_into().unwrap()),
+    }
+}
+
 /// Handle to retrieve an asynchronous result of a remote function call.
 ///
 /// To wait on the associated result, use [`wait`](Self::wait).
 #[derive(Debug)]
-pub struct ResultHandle(usize);
+pub struct ResultHandle(pub usize);
 
 impl ResultHandle {
     /// Tries to read the lattice value stored for given key from the key-value

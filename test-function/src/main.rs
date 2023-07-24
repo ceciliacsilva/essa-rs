@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use anna_api::lattice::{Lattice, SetLattice};
+use essa_api::deltalake_save;
 use essa_test_function::{
     append_foo, concurrent_kvs_test_extern, repeat_string_extern, to_uppercase_extern,
 };
@@ -53,7 +54,33 @@ fn main() {
         &measures_df,
     )
     .unwrap();
-    let _median_impedance_r = to_median_impedance.wait().unwrap();
+
+   //  let median_impedance_r = to_median_impedance.wait().unwrap();
+
+//     let metric_calculation = essa_api::run_r(
+//     "function(measure_matrix, median_impedance_r){
+//   metric_vector = vector()
+//   CCD = vector()
+
+//   for(i in 1:batch_size){
+//     metric_vector[i] = sqrt(  sum(  (measure_matrix[,i] - median_impedance_r)^2/frequency_points_qnt  ))
+
+//     CCD[i] = 1 - sum( (measure_matrix[,i] - mean(measure_matrix[,i])) *
+//                           (median_impedance_r - mean(median_impedance_r)) /
+//                                   (sd(measure_matrix[,i]) * sd(median_impedance_r)) ) / frequency_points_qnt
+//   }
+
+//   return(metric_vector)
+// }",
+//     median_impedance_r
+//     ).unwrap();
+
+    // TODO: this should be better.
+    println!("to_median_impedance.0: {:?}", to_median_impedance.0);
+    let _ = deltalake_save(
+        "/home/ceciliacsilva/Desktop/shm/result",
+        to_median_impedance.0,
+    );
 
     println!("Hello world from test function!");
     let result = to_uppercase_extern("foobar".into()).expect("extern function call failed");

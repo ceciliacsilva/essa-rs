@@ -111,7 +111,7 @@ async fn r_executor(
                         bincode::deserialize(&args_from_anna)?;
 
                     let rdf: r_polars::rdataframe::DataFrame = result.into();
-                    println!("dataframe: {:?}", rdf);
+                    log::info!("dataframe: {:?}", rdf);
 
                     let rlist: r_polars::Robj = rdf.to_list_result().unwrap().into();
 
@@ -127,7 +127,7 @@ async fn r_executor(
                             }
                         }
                         None => {
-                            println!("no args");
+                            log::info!("R function has no args");
                         }
                     }
 
@@ -136,7 +136,7 @@ async fn r_executor(
                     let mut results = result.as_real_slice().unwrap().chunks_exact(result.len());
                     if let Some(dim) = result.dim() {
                         match dim.iter().collect::<Vec<_>>().as_slice() {
-                            &[line, col] => {
+                            &[_line, col] => {
                                 results =
                                     result.as_real_slice().unwrap().chunks_exact(col.0 as usize)
                             }
@@ -154,6 +154,8 @@ async fn r_executor(
                     }
 
                     final_result = par_read_robjs(par_objs)?;
+
+                    println!("result: {:?}", final_result);
                 }
 
                 let serialize = bincode::serialize(&final_result)?;
