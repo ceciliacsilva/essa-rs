@@ -16,7 +16,7 @@ use anna::lattice::Lattice;
 
 use deltalake::{
     arrow::{
-        array::{Int32Array, ArrayData, as_list_array},
+        array::{as_list_array, ArrayData, Int32Array},
         datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit},
         record_batch::RecordBatch,
     },
@@ -245,13 +245,18 @@ pub async fn save_to_deltalake_loop(
 
 fn convert_between_arrow_formats(
     from_polars: DataFrame,
-    column_name: &str
+    column_name: &str,
 ) -> Vec<deltalake::arrow::array::ArrayRef> {
-    let chunked_array = from_polars.column(column_name).expect(&format!("{:?} not found in {:?}", column_name, from_polars)).chunks();
-     //println!("{:?}", chunked_array);
+    let chunked_array = from_polars
+        .column(column_name)
+        .expect(&format!("{:?} not found in {:?}", column_name, from_polars))
+        .chunks();
+    //println!("{:?}", chunked_array);
     let mut data = vec![];
     for chunk in chunked_array {
-        let array = chunk.as_any().downcast_ref::<r_polars::polars::export::arrow::array::Float64Array>();
+        let array = chunk
+            .as_any()
+            .downcast_ref::<r_polars::polars::export::arrow::array::Float64Array>();
         for a in array.unwrap() {
             data.push(a.unwrap().clone());
         }

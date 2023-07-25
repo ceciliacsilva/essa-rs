@@ -80,7 +80,7 @@ async fn r_executor(
         match reply.recv_async().await {
             Ok(query) => {
                 let mut topic_split = query.key_expr().as_str().split('/');
-                let args = topic_split
+                let key_to_args = topic_split
                     .next_back()
                     .context("no args key in topic")?
                     .to_owned();
@@ -89,8 +89,23 @@ async fn r_executor(
                     .context("no func in topic")?
                     .to_owned();
 
+                let serialized_args_vec_key = kvs_get(key_to_args.into(), &mut anna_client)?;
+
+                let serialized_args_vec_key: Vec<u8> = serialized_args_vec_key
+                    .into_lww()
+                    .map_err(eyre_to_anyhow)
+                    .context("func is not a LWW lattice")?
+                    .into_revealed()
+                    .into_value();
+
+                let args_vec_key: Vec<ClientKey> = bincode::deserialize(&serialized_args_vec_key)?;
+
                 let func = kvs_get(func.into(), &mut anna_client)?;
-                let args = kvs_get(args.into(), &mut anna_client)?;
+                let mut args_vec = vec![];
+                for args_key in args_vec_key {
+                    args_vec.push(kvs_get(args_key.into(), &mut anna_client)?);
+                }
+
                 let mut final_result: Vec<r_polars::polars::prelude::Series> = Vec::new();
 
                 {
@@ -100,20 +115,34 @@ async fn r_executor(
                         .context("func is not a LWW lattice")?
                         .into_revealed()
                         .into_value();
-                    let args_from_anna = args
-                        .into_lww()
-                        .map_err(eyre_to_anyhow)
-                        .context("args is not a LWW lattice")?
-                        .into_revealed()
-                        .into_value();
+                    // TODO: avoid clone by giving up ownership
+                    let args_from_anna_vec: Vec<Vec<u8>> = args_vec
+                        .iter()
+                        .map(|arg| {
+                            arg.clone().into_lww()
+                                .map_err(eyre_to_anyhow)
+                                .context("args is not a LWW lattice")
+                                .unwrap()
+                                .into_revealed()
+                                .into_value()
+                        })
+                        .collect();
 
-                    let result: r_polars::polars::prelude::DataFrame =
-                        bincode::deserialize(&args_from_anna)?;
+                    let dataframes: Vec<r_polars::polars::prelude::DataFrame> = args_from_anna_vec
+                        .iter()
+                        .map(|args_from_anna| bincode::deserialize(&args_from_anna).unwrap())
+                        .collect();
 
-                    let rdf: r_polars::rdataframe::DataFrame = result.into();
-                    log::info!("dataframe: {:?}", rdf);
+                    let r_dataframes: Vec<r_polars::rdataframe::DataFrame> = dataframes
+                        .iter()
+                        .map(|dataframe| (*dataframe).clone().into())
+                        .collect();
+                    log::info!("dataframes: {:?}", r_dataframes);
 
-                    let rlist: r_polars::Robj = rdf.to_list_result().unwrap().into();
+                    let r_lists: Vec<r_polars::Robj> = r_dataframes
+                        .iter()
+                        .map(|r_dataframe| r_dataframe.to_list_result().unwrap().into())
+                        .collect();
 
                     let function = String::from_utf8(func)?;
                     let func: Robj = eval_string(&function).unwrap();
@@ -122,8 +151,8 @@ async fn r_executor(
                     let mut arguments_pairlist: Vec<(&str, Robj)> = vec![];
                     match arguments {
                         Some(args) => {
-                            if let Some(name) = args.names().next() {
-                                arguments_pairlist.push((name, rlist));
+                            for (name, r_list) in args.names().zip(r_lists) {
+                                arguments_pairlist.push((name, r_list));
                             }
                         }
                         None => {
@@ -155,7 +184,7 @@ async fn r_executor(
 
                     final_result = par_read_robjs(par_objs)?;
 
-                    println!("result: {:?}", final_result);
+                    //println!("result: {:?}", final_result);
                 }
 
                 let serialize = bincode::serialize(&final_result)?;

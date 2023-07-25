@@ -94,14 +94,14 @@ pub fn call_function(function_name: &str, args: &[u8]) -> Result<ResultHandle, E
 /// struct.
 ///
 /// This function is an abstraction over [`c_api::essa_run_r`].
-pub fn run_r(function: &str, args: &[u8]) -> Result<ResultHandle, EssaResult> {
+pub fn run_r(function: &str, args: &[usize]) -> Result<ResultHandle, EssaResult> {
     let mut result_handle = 0;
     let result = unsafe {
         essa_run_r(
             function.as_ptr(),
             function.len(),
             args.as_ptr(),
-            args.len(),
+            std::mem::size_of::<usize>() * args.len(),
             &mut result_handle,
         )
     };

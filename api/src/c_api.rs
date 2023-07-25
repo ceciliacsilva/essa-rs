@@ -209,7 +209,7 @@ extern "C" {
     pub fn essa_run_r(
         function_name_ptr: *const u8,
         function_name_len: usize,
-        args_ptr: *const u8,
+        args_ptr: *const usize,
         args_len: usize,
         result_handle: *mut usize,
     ) -> i32;

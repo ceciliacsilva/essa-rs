@@ -9,7 +9,7 @@ use anna::{lattice::LastWriterWinsLattice, nodes::ClientNode, ClientKey};
 use anyhow::{bail, Context};
 use essa_common::{scheduler_function_call_topic, scheduler_run_r_function_call_topic};
 use flume::Receiver;
-use std::{collections::HashMap, sync::Arc, ops::Deref};
+use std::{collections::HashMap, ops::Deref, sync::Arc};
 use uuid::Uuid;
 use wasmtime::{Caller, Engine, Extern, Linker, Module, Store, ValType};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder};
@@ -648,7 +648,8 @@ fn essa_get_result_wrapper(
                 )
                 .context("val_len_ptr out of bounds")?;
 
-                caller.data_mut().remove_result(handle);
+                // TODO: is it ok to stop removing this??
+                //caller.data_mut().remove_result(handle);
 
                 Ok(EssaResult::Ok)
             }
@@ -868,11 +869,41 @@ impl HostState {
         )
         .map_err(|_| EssaResult::UnknownError)?;
 
-        // store args in kvs
-        let args_key: ClientKey = Uuid::new_v4().to_string().into();
+        let args_handles: Vec<u32> = split_args_to_handles(&args);
+        println!("args_handles: {:?} ", args_handles);
+
+        // TODO: this should be better
+        let args_values: Vec<Arc<Vec<u8>>> = args_handles
+            .iter()
+            .map(|handle: &u32| {
+                // TODO: remove unwrap()
+                smol::block_on(self.get_result(*handle))
+                    .map_err(|_| EssaResult::UnknownError)
+                    .unwrap()
+            })
+            .collect();
+
+        let mut args_key_vec = vec![];
+
+        for args in args_values {
+            // get `args` from `Arc`.
+            let args = unsafe { &*Arc::into_raw(args.clone()) }.clone();
+            let args_key: ClientKey = Uuid::new_v4().to_string().into();
+            kvs_put(
+                args_key.clone(),
+                LastWriterWinsLattice::new_now(args.into()).into(),
+                &mut self.anna,
+            )
+            .map_err(|_| EssaResult::UnknownError)?;
+            args_key_vec.push(args_key);
+        }
+
+        let args_vec_key: ClientKey = Uuid::new_v4().to_string().into();
+        let serialized_args_key_vec =
+            bincode::serialize(&args_key_vec).map_err(|_| EssaResult::UnknownError)?;
         kvs_put(
-            args_key.clone(),
-            LastWriterWinsLattice::new_now(args.into()).into(),
+            args_vec_key.clone(),
+            LastWriterWinsLattice::new_now(serialized_args_key_vec).into(),
             &mut self.anna,
         )
         .map_err(|_| EssaResult::UnknownError)?;
@@ -880,7 +911,7 @@ impl HostState {
         // trigger the function call on a remote node
         let reply = smol::block_on(run_r_extern(
             func_key,
-            args_key,
+            args_vec_key,
             self.zenoh.clone(),
             &self.zenoh_prefix,
         ))
@@ -1091,4 +1122,20 @@ async fn deltalake_save_extern(
         .context("failed save deltalake")?;
 
     Ok(reply)
+}
+
+fn split_args_to_handles(args: &[u8]) -> Vec<u32> {
+    let mut ptr_args = args;
+    let mut handles = vec![];
+
+    loop {
+        let (int_bytes, rest) = ptr_args.split_at(std::mem::size_of::<u32>());
+
+        handles.push(u32::from_ne_bytes(int_bytes.try_into().unwrap()));
+        ptr_args = rest;
+
+        if rest.is_empty() {
+            return handles;
+        }
+    }
 }
