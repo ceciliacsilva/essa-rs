@@ -26,6 +26,9 @@ use polars_sql::SQLContext;
 use r_polars::polars::prelude::*;
 use std::path::Path;
 
+use sqlparser::{dialect::GenericDialect, ast::TableWithJoins};
+use sqlparser::parser::Parser;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let zenoh = Arc::new(
@@ -115,12 +118,25 @@ pub async fn polars_loop(zenoh: Arc<zenoh::Session>, _zenoh_prefix: &str) -> any
                     let _ = dfs.push(df);
                 }
 
-                let out = diag_concat_lf(&dfs, false, false)?;
-
-                // TODO: has to be `table` name, comming from query.
-                ctx.register("aquisicoes", out);
+                let lazy_frame = diag_concat_lf(&dfs, false, false)?;
 
                 let sql_query = String::from_utf8(sql_query)?;
+                let dialect = &GenericDialect;
+                let select = Parser::new(dialect)
+                    .try_with_sql(&sql_query)?
+                    .parse_select()?;
+                let table_name =
+                    match select.from.get(0) {
+                        Some(TableWithJoins { relation, joins: _j }) => relation.to_string(),
+                        _ => {
+                            log::info!("Could not a Table name");
+                            "demo".to_string()
+                        },
+                    };
+
+                // TODO: has to be `table` name, comming from query.
+                ctx.register(&table_name, lazy_frame);
+
                 let result: r_polars::polars::prelude::DataFrame =
                     ctx.execute(&sql_query).unwrap().collect().unwrap();
 

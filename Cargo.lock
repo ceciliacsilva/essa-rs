@@ -1928,6 +1928,7 @@ dependencies = [
  "r_polars",
  "serde",
  "smol",
+ "sqlparser 0.35.0",
  "tokio",
  "uuid 0.8.2",
  "wasmedge-sdk",

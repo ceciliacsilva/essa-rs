@@ -31,6 +31,7 @@ r_polars = { path = "/home/ceciliacsilva/external-projects/r-polars/src/rust" }
 #polars-sql = { git = "https://github.com/pola-rs/polars.git", rev = "e973f6386a28f16136fb8ba5a737103f95911861"}
 polars-sql = { path = "/home/ceciliacsilva/external-projects/polars/polars/polars-sql" }
 parquet = "42.0.0"
+sqlparser = "0.35"
 
 [features]
 default = ["wasmtime_executor"]
