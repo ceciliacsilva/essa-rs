@@ -162,29 +162,13 @@ async fn r_executor(
 
                     let result = func.call(Pairlist::from_pairs(arguments_pairlist)).unwrap();
 
-                    let mut results = result.as_real_slice().unwrap().chunks_exact(result.len());
-                    if let Some(dim) = result.dim() {
-                        match dim.iter().collect::<Vec<_>>().as_slice() {
-                            &[_line, col] => {
-                                results =
-                                    result.as_real_slice().unwrap().chunks_exact(col.0 as usize)
-                            }
-                            _ => (),
-                        }
-                    };
-
-                    let mut par_objs = vec![];
-
-                    for (i, result) in results.enumerate() {
-                        par_objs.push((
-                            r_polars::utils::extendr_concurrent::ParRObj(result.into()),
-                            i.to_string(),
-                        ));
-                    }
-
-                    final_result = par_read_robjs(par_objs)?;
-
-                    //println!("result: {:?}", final_result);
+                    final_result =
+                        match result.rtype() {
+                            Rtype::Integers => convert_from_robj_integer_to_polars(result)?,
+                            Rtype::Doubles => convert_from_robj_real_to_polars(result)?,
+                            // TODO: error handling
+                            _ => vec![],
+                        };
                 }
 
                 let serialize = bincode::serialize(&final_result)?;
@@ -202,6 +186,54 @@ async fn r_executor(
     }
 
     Ok(())
+}
+
+fn convert_from_robj_integer_to_polars(result: Robj) -> anyhow::Result<Vec<r_polars::polars::prelude::Series>> {
+    let mut results = result.as_integer_slice().unwrap().chunks_exact(result.len());
+    if let Some(dim) = result.dim() {
+        match dim.iter().collect::<Vec<_>>().as_slice() {
+            &[_line, col] => {
+                results =
+                    result.as_integer_slice().unwrap().chunks_exact(col.0 as usize)
+            }
+            _ => (),
+        }
+    };
+
+    let mut par_objs = vec![];
+
+    for (i, result) in results.enumerate() {
+        par_objs.push((
+            r_polars::utils::extendr_concurrent::ParRObj(result.into()),
+            i.to_string(),
+        ));
+    }
+
+    Ok(par_read_robjs(par_objs)?)
+}
+
+fn convert_from_robj_real_to_polars(result: Robj) -> anyhow::Result<Vec<r_polars::polars::prelude::Series>> {
+    let mut results = result.as_real_slice().unwrap().chunks_exact(result.len());
+    if let Some(dim) = result.dim() {
+        match dim.iter().collect::<Vec<_>>().as_slice() {
+            &[_line, col] => {
+                results =
+                    result.as_real_slice().unwrap().chunks_exact(col.0 as usize)
+            }
+            _ => (),
+        }
+    };
+
+    let mut par_objs = vec![];
+
+    for (i, result) in results.enumerate() {
+        par_objs.push((
+            r_polars::utils::extendr_concurrent::ParRObj(result.into()),
+            i.to_string(),
+        ));
+    }
+
+    Ok(par_read_robjs(par_objs)?)
 }
 
 /// Get the given value in the key-value store.

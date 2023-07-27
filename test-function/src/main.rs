@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use anna_api::lattice::{Lattice, SetLattice};
 use essa_api::deltalake_save;
 use essa_test_function::{
-    append_foo, concurrent_kvs_test_extern, repeat_string_extern, to_uppercase_extern,
+    append_foo, repeat_string_extern, to_uppercase_extern,
 };
 
 fn main() {
@@ -15,13 +15,33 @@ fn main() {
 
     println!("Testing R integration!");
 
+    let batch_size = essa_api::run_r(
+        "function(pzt_batch_measures){
+            return(length(pzt_batch_measures$resistencia))
+}",
+        &[to_get_acquisitions.0],
+    ).unwrap();
+
+    let temperature = essa_api::run_r(
+        "function(pzt_batch_measures){
+            return(pzt_batch_measures$temperatura)
+}",
+        &[to_get_acquisitions.0],
+    ).unwrap();
+
+    let frequency_points_qnt = essa_api::run_r(
+        "function(pzt_batch_measures){
+            return(length(pzt_batch_measures$frequencia[[1]]))
+}",
+        &[to_get_acquisitions.0],
+    ).unwrap();
+
     let to_measures = essa_api::run_r(
-        r#"function(pzt_batch_measures){
+        r#"function(pzt_batch_measures, batch_size, frequency_points_qnt){
+  batch_size <- unlist(batch_size)[[1]]
+  frequency_points_qnt <- unlist(frequency_points_qnt)[[1]]
   impedance_r <- pzt_batch_measures$resistencia
   frequency_points <- pzt_batch_measures$frequencia[[1]]
-
-  batch_size <- length(impedance_r)
-  frequency_points_qnt <- length(frequency_points)
 
   measure_matrix <- matrix(NA, frequency_points_qnt, batch_size)
 
@@ -30,18 +50,15 @@ fn main() {
   }
   return(measure_matrix)
 }"#,
-        &[to_get_acquisitions.0],
+        &[to_get_acquisitions.0, batch_size.0, frequency_points_qnt.0],
     )
     .unwrap();
 
     let to_median_impedance = essa_api::run_r(
-        r#"function(measure_df){
+        r#"function(measure_df, batch_size, frequency_points_qnt){
+  batch_size <- unlist(batch_size)[[1]]
+  frequency_points_qnt <- unlist(frequency_points_qnt)[[1]]
   median_impedance_r = vector()
-  batch_size <- length(measure_df[1])
-  frequency_points_qnt <- length(measure_df)
-  print(measure_df)
-  print(batch_size)
-  print(frequency_points_qnt)
   measure_matrix = matrix(unlist(measure_df), ncol=batch_size)
 
   for(i in 1:frequency_points_qnt){
@@ -50,19 +67,23 @@ fn main() {
 
   return(median_impedance_r)
 }"#,
-        &[to_measures.0],
+        &[to_measures.0, batch_size.0, frequency_points_qnt.0],
     )
     .unwrap();
 
+    let _ = deltalake_save(
+        "/home/ceciliacsilva/Desktop/shm/median",
+        &[to_median_impedance.0],
+    );
+
     let metric_calculation = essa_api::run_r(
-    r#"function(measure_matrix, median_impedance_r){
+    r#"function(measure_matrix, median_impedance_r, batch_size, frequency_points_qnt){
+  batch_size <- unlist(batch_size)[[1]]
+  frequency_points_qnt <- unlist(frequency_points_qnt)[[1]]
   metric_vector = vector()
   CCD = vector()
-  print(measure_matrix[1])
-  batch_size <- length(measure_matrix$'0')
-  frequency_points_qnt <- length(measure_matrix)
   measure_matrix = matrix(unlist(measure_matrix), ncol = batch_size)
-  median_impedance_r = matrix(unlist(measure_matrix), nrow=1)
+  median_impedance_r = matrix(unlist(measure_matrix), ncol=1)
 
   for(i in 1:batch_size){
     metric_vector[i] = sqrt(  sum(  (measure_matrix[,i] - median_impedance_r)^2/frequency_points_qnt  ))
@@ -72,17 +93,15 @@ fn main() {
                                   (sd(measure_matrix[,i]) * sd(median_impedance_r)) ) / frequency_points_qnt
   }
 
-  print(metric_vector)
-  print(CCD)
   return(metric_vector)
 }"#,
-    &[to_measures.0, to_median_impedance.0]
+    &[to_measures.0, to_median_impedance.0, batch_size.0, frequency_points_qnt.0]
     ).unwrap();
 
     // TODO: this should be better.
     let _ = deltalake_save(
         "/home/ceciliacsilva/Desktop/shm/result",
-        metric_calculation.0,
+        &[metric_calculation.0, temperature.0],
     );
 
     println!("Hello world from test function!");

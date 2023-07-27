@@ -132,13 +132,14 @@ pub fn datafusion_run(sql_query: &str, table: &str) -> Result<ResultHandle, Essa
 }
 
 /// Involkes save to `deltalake` the given `dataframe`.
-pub fn deltalake_save(table_path: &str, result_handler: usize) -> Result<ResultHandle, EssaResult> {
+pub fn deltalake_save(table_path: &str, dataframe_handles: &[usize]) -> Result<ResultHandle, EssaResult> {
     let mut result_handle = 0;
     let result = unsafe {
         essa_deltalake_save(
             table_path.as_ptr(),
             table_path.len(),
-            result_handler,
+            dataframe_handles.as_ptr(),
+            std::mem::size_of::<usize>() * dataframe_handles.len(),
             &mut result_handle,
         )
     };

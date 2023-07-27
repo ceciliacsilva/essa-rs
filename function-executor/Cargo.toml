@@ -25,10 +25,12 @@ uuid = {version = "0.8.2", features = ["v4"]}
 zenoh = "0.7.0-rc"
 tokio = { version = "1.28", features = ["rt-multi-thread", "macros"] }
 flume = "0.10"
-deltalake = { version = "0.12.0" }
+#deltalake = { version = "0.12.0" }
+deltalake = { version = "0.13.0", path = "/home/ceciliacsilva/external-projects/delta-rs/rust", features = ["datafusion"] }
 r_polars = { path = "/home/ceciliacsilva/external-projects/r-polars/src/rust" }
-polars-sql = { git = "https://github.com/pola-rs/polars.git", rev = "e973f6386a28f16136fb8ba5a737103f95911861"}
-
+#polars-sql = { git = "https://github.com/pola-rs/polars.git", rev = "e973f6386a28f16136fb8ba5a737103f95911861"}
+polars-sql = { path = "/home/ceciliacsilva/external-projects/polars/polars/polars-sql" }
+parquet = "42.0.0"
 
 [features]
 default = ["wasmtime_executor"]

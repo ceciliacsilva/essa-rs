@@ -282,13 +282,15 @@ fn set_up_module(
             |caller: Caller<'_, HostState>,
              table_path_ptr: u32,
              table_path_len: u32,
-             dataframe_result_handler: u32,
+             dataframe_handler_ptr: u32,
+             dataframe_handler_len: u32,
              result_handle_ptr: u32| {
                 essa_deltalake_save_wrapper(
                     caller,
                     table_path_ptr,
                     table_path_len,
-                    dataframe_result_handler,
+                    dataframe_handler_ptr,
+                    dataframe_handler_len,
                     result_handle_ptr,
                 )
                 .map(|r| r as i32)
@@ -540,7 +542,8 @@ fn essa_deltalake_save_wrapper(
     mut caller: Caller<HostState>,
     table_path_ptr: u32,
     table_path_len: u32,
-    dataframe_handler: u32,
+    dataframe_handler_ptr: u32,
+    dataframe_handler_len: u32,
     result_handle_ptr: u32,
 ) -> anyhow::Result<EssaResult> {
     // Use our `caller` context to get the memory export of the
@@ -557,9 +560,17 @@ fn essa_deltalake_save_wrapper(
         String::from_utf8(data).context("sql_query name not valid utf8")?
     };
 
+    // read the serialized function arguments from the WASM sandbox
+    let args = {
+        let mut data = vec![0u8; dataframe_handler_len as usize];
+        mem.read(&caller, dataframe_handler_ptr as usize, &mut data)
+            .context("function args ptr/len out of bounds")?;
+        data
+    };
+
     match caller
         .data_mut()
-        .essa_deltalake_save(table_path, dataframe_handler)
+        .essa_deltalake_save(table_path, args)
     {
         Ok(result) => {
             let host_state = caller.data_mut();
@@ -630,7 +641,6 @@ fn essa_get_result_wrapper(
         _ => bail!("failed to find host memory"),
     };
 
-    println!("handler: {:?}", handle);
     // get the corresponding value from the KVS
     match smol::block_on(caller.data_mut().get_result(handle)) {
         Ok(value) => {
@@ -870,7 +880,6 @@ impl HostState {
         .map_err(|_| EssaResult::UnknownError)?;
 
         let args_handles: Vec<u32> = split_args_to_handles(&args);
-        println!("args_handles: {:?} ", args_handles);
 
         // TODO: this should be better
         let args_values: Vec<Arc<Vec<u8>>> = args_handles
@@ -961,7 +970,7 @@ impl HostState {
     fn essa_deltalake_save(
         &mut self,
         table_path: String,
-        dataframe_handle: u32,
+        args: Vec<u8>,
     ) -> Result<flume::Receiver<Reply>, EssaResult> {
         let table_path_key: ClientKey = Uuid::new_v4().to_string().into();
         kvs_put(
@@ -971,14 +980,40 @@ impl HostState {
         )
         .map_err(|_| EssaResult::UnknownError)?;
 
-        let dataframe = smol::block_on(self.get_result(dataframe_handle))?;
-        let dataframe_key: ClientKey = Uuid::new_v4().to_string().into();
-        // TODO: could this be better?
-        let dataframe = unsafe { &*Arc::into_raw(dataframe.clone()) }.clone();
+        let args_handles: Vec<u32> = split_args_to_handles(&args);
+
+        // TODO: this should be better
+        let args_values: Vec<Arc<Vec<u8>>> = args_handles
+            .iter()
+            .map(|handle: &u32| {
+                // TODO: remove unwrap()
+                smol::block_on(self.get_result(*handle))
+                    .map_err(|_| EssaResult::UnknownError)
+                    .unwrap()
+            })
+            .collect();
+
+        let mut args_key_vec = vec![];
+
+        for args in args_values {
+            // get `args` from `Arc`.
+            let args = unsafe { &*Arc::into_raw(args.clone()) }.clone();
+            let args_key: ClientKey = Uuid::new_v4().to_string().into();
+            kvs_put(
+                args_key.clone(),
+                LastWriterWinsLattice::new_now(args.into()).into(),
+                &mut self.anna,
+            )
+            .map_err(|_| EssaResult::UnknownError)?;
+            args_key_vec.push(args_key);
+        }
+
+        let args_vec_key: ClientKey = Uuid::new_v4().to_string().into();
+        let serialized_args_key_vec =
+            bincode::serialize(&args_key_vec).map_err(|_| EssaResult::UnknownError)?;
         kvs_put(
-            dataframe_key.clone(),
-            // TODO: this could be better
-            LastWriterWinsLattice::new_now(dataframe).into(),
+            args_vec_key.clone(),
+            LastWriterWinsLattice::new_now(serialized_args_key_vec).into(),
             &mut self.anna,
         )
         .map_err(|_| EssaResult::UnknownError)?;
@@ -986,7 +1021,7 @@ impl HostState {
         // trigger the function call on a remote node
         let reply = smol::block_on(deltalake_save_extern(
             table_path_key,
-            dataframe_key,
+            args_vec_key,
             self.zenoh.clone(),
             &self.zenoh_prefix,
         ))
@@ -1022,8 +1057,6 @@ impl HostState {
                         EssaResult::UnknownError
                     })?;
 
-                    //println!("reply: {reply:?}");
-
                     let value = reply
                         .sample
                         .map_err(|_e| EssaResult::UnknownError)?
@@ -1032,7 +1065,6 @@ impl HostState {
                         .contiguous()
                         .into_owned();
 
-                    //println!("value: {value:?}");
                     let value = entry.insert(Arc::new(value));
                     Ok(value.clone())
                 } else {

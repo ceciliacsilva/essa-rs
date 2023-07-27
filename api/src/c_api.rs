@@ -235,7 +235,8 @@ extern "C" {
     pub fn essa_deltalake_save(
         table_path: *const u8,
         table_path_len: usize,
-        dataframe_result_handler: usize,
+        dataframe_handler_ptr: *const usize,
+        dataframe_handler_len: usize,
         result_handler: *mut usize,
     ) -> i32;
 }

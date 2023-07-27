@@ -16,15 +16,14 @@ use anna::lattice::Lattice;
 
 use deltalake::{
     arrow::{
-        array::{as_list_array, ArrayData, Int32Array},
-        datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit},
+        datatypes::{DataType, Field, Schema as ArrowSchema},
         record_batch::RecordBatch,
     },
-    DeltaOps, DeltaTable, SchemaDataType, SchemaField, SchemaTypeArray,
+    DeltaOps, DeltaTable, SchemaDataType, SchemaField,
 };
-use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesBuilder};
+use parquet::file::properties::WriterProperties;
 use polars_sql::SQLContext;
-use r_polars::{polars::prelude::*, Dataframe};
+use r_polars::polars::prelude::*;
 use std::path::Path;
 
 #[tokio::main]
@@ -134,6 +133,7 @@ pub async fn polars_loop(zenoh: Arc<zenoh::Session>, _zenoh_prefix: &str) -> any
                     .res()
                     .await
                     .expect("failed to send sample back");
+
                 log::info!("Sending result back");
             }
             Err(e) => {
@@ -166,7 +166,7 @@ pub async fn save_to_deltalake_loop(
         match reply.recv_async().await {
             Ok(query) => {
                 let mut topic_split = query.key_expr().as_str().split('/');
-                let data_key: String = topic_split
+                let key_to_args: String = topic_split
                     .next_back()
                     .context("no args key in topic")?
                     .to_owned();
@@ -175,44 +175,83 @@ pub async fn save_to_deltalake_loop(
                     .context("no args in topic")?
                     .to_owned();
 
-                let k: ClientKey = data_key.clone().into();
-                println!("data: {:?}", k);
+                let serialized_args_vec_key = kvs_get(key_to_args.into(), &mut anna_client)?;
+
+                let serialized_args_vec_key: Vec<u8> = serialized_args_vec_key
+                    .into_lww()
+                    .map_err(eyre_to_anyhow)
+                    .context("func is not a LWW lattice")?
+                    .into_revealed()
+                    .into_value();
+
+                let args_vec_key: Vec<ClientKey> = bincode::deserialize(&serialized_args_vec_key)?;
+
+                let mut args_vec = vec![];
+                for args_key in args_vec_key {
+                    args_vec.push(kvs_get(args_key.into(), &mut anna_client)?);
+                }
 
                 let delta_table = kvs_get(delta_table_key.into(), &mut anna_client)?;
-                let data = kvs_get(data_key.into(), &mut anna_client)?;
+
                 let delta_table_path = delta_table
                     .into_lww()
                     .map_err(crate::eyre_to_anyhow)
                     .context("delta_table is not a LWW lattice")?
                     .into_revealed()
                     .into_value();
-                let data = data
-                    .into_lww()
-                    .map_err(crate::eyre_to_anyhow)
-                    .context("sql_query is not a LWW lattice")?
-                    .into_revealed()
-                    .into_value();
 
-                let data_df: r_polars::polars::prelude::DataFrame = bincode::deserialize(&data)?;
+                let args_from_anna_vec: Vec<Vec<u8>> = args_vec
+                    .iter()
+                    .map(|arg| {
+                        arg.clone().into_lww()
+                            .map_err(eyre_to_anyhow)
+                            .context("args is not a LWW lattice")
+                            .unwrap()
+                            .into_revealed()
+                            .into_value()
+                    })
+                    .collect();
 
-                println!("data_df: {:?}", data_df);
+                let dataframes: Vec<r_polars::polars::prelude::DataFrame> = args_from_anna_vec
+                    .iter()
+                    .map(|args_from_anna| bincode::deserialize(&args_from_anna).unwrap())
+                    .collect();
 
-                let schema = data_df.fields()[0].to_arrow();
-                println!("{:?}", schema);
+                let mut schema_vec = vec![];
 
-                let schema = ArrowSchema::new(vec![Field::new("id", DataType::Float64, false)]);
+                for (i, dataframe) in dataframes.iter().enumerate() {
+                    for schema in dataframe.fields() {
+                        let schema = schema.to_arrow();
+                        let data_type =
+                            // TODO: missing other conversions.
+                            match schema.data_type {
+                                ArrowDataType::Float64 => DataType::Float64,
+                                ArrowDataType::Int32 => DataType::Int32,
+                                _ => DataType::Float64,
+                            };
 
-                let array_ref_column = convert_between_arrow_formats(data_df, "0");
-                let batch = RecordBatch::try_new(Arc::new(schema), array_ref_column).unwrap();
-                println!("batch: {:?}", batch);
+                        schema_vec.push(Field::new(format!("{}-{}", schema.name, i), data_type, schema.is_nullable));
+                    }
+                }
+
+                let arrow_schema = ArrowSchema::new(schema_vec.clone());
+                let mut array_ref_columns = vec![];
+                for dataframe in &dataframes {
+                    for column_name in dataframe.get_column_names() {
+                        array_ref_columns.push(convert_between_arrow_formats(&dataframe, column_name));
+                    }
+                }
+
+                let batch = RecordBatch::try_new(Arc::new(arrow_schema), array_ref_columns).unwrap();
 
                 let delta_table_path = String::from_utf8(delta_table_path)?;
 
                 let table_dir = Path::new(&delta_table_path);
-                println!("table_dir: {:?}", table_dir);
-                let table_name = "result";
+                log::info!("table_dir: {:?}", table_dir);
+                let table_name = table_dir.file_name().unwrap().to_str().unwrap();
+                log::info!("table_name: {:?}", table_name);
                 let comment = "A table with median resistence shm";
-                let table = create_or_open_delta_table(table_dir, table_name, comment)
+                let table = create_or_open_delta_table(table_dir, table_name, comment, schema_vec)
                     .await
                     .unwrap();
                 // TODO: missing writer properties config.
@@ -223,7 +262,7 @@ pub async fn save_to_deltalake_loop(
                     .await
                     .unwrap();
 
-                println!("table: {:?}", table);
+                log::info!("table: {:?}", table);
 
                 let serialized_result = bincode::serialize("oi").unwrap();
 
@@ -244,9 +283,9 @@ pub async fn save_to_deltalake_loop(
 }
 
 fn convert_between_arrow_formats(
-    from_polars: DataFrame,
+    from_polars: &DataFrame,
     column_name: &str,
-) -> Vec<deltalake::arrow::array::ArrayRef> {
+) -> deltalake::arrow::array::ArrayRef {
     let chunked_array = from_polars
         .column(column_name)
         .expect(&format!("{:?} not found in {:?}", column_name, from_polars))
@@ -262,13 +301,14 @@ fn convert_between_arrow_formats(
         }
     }
 
-    vec![Arc::new(deltalake::arrow::array::Float64Array::from(data))]
+    Arc::new(deltalake::arrow::array::Float64Array::from(data))
 }
 
 async fn create_or_open_delta_table(
     table_dir: &Path,
     table_name: &str,
     comment: &str,
+    schema_vec: Vec<Field>,
 ) -> Result<DeltaTable, Box<dyn std::error::Error>> {
     let ops = DeltaOps::try_from_uri(table_dir.to_str().expect("Not a valid OS Path"))
         .await
@@ -279,7 +319,7 @@ async fn create_or_open_delta_table(
     // options are set you can run the command using `.await`.
     let table = match ops
         .create()
-        .with_columns(get_table_columns())
+        .with_columns(get_table_columns(schema_vec))
         .with_table_name(table_name)
         .with_comment(comment)
         .await
@@ -297,55 +337,77 @@ async fn create_or_open_delta_table(
     Ok(table)
 }
 
-fn get_table_columns() -> Vec<SchemaField> {
-    vec![
-        SchemaField::new(
-            String::from("id"),
-            SchemaDataType::primitive(String::from("float")),
-            false,
-            Default::default(),
-        ),
-        // SchemaField::new(
-        //      String::from("frequencia"),
-        //      SchemaDataType::array(SchemaTypeArray::new(
-        //          Box::new(SchemaDataType::primitive(String::from("double"))),
-        //          true,
-        //      )),
-        //      true,
-        //      Default::default(),
-        //  ),
-        //  SchemaField::new(
-        //      String::from("sensor_id"),
-        //      SchemaDataType::primitive(String::from("long")),
-        //      false,
-        //      Default::default(),
-        //  ),
-        //  SchemaField::new(
-        //      String::from("ciclo"),
-        //      SchemaDataType::primitive(String::from("long")),
-        //      false,
-        //      Default::default(),
-        //  ),
-        //  SchemaField::new(
-        //      String::from("execucao_ciclo_id"),
-        //      SchemaDataType::primitive(String::from("long")),
-        //      false,
-        //      Default::default(),
-        //  ),
-        //  SchemaField::new(
-        //      String::from("repeticao"),
-        //      SchemaDataType::primitive(String::from("long")),
-        //      false,
-        //      Default::default(),
-        //  ),
-        //  SchemaField::new(
-        //      String::from("data_hora"),
-        //      SchemaDataType::primitive(String::from("timestamp")),
-        //      false,
-        //      Default::default(),
-        //  ),
-    ]
+fn get_table_columns(schema_vec: Vec<Field>) -> Vec<SchemaField> {
+    let mut table_columns = vec![];
+    for field in schema_vec {
+        let datatype =
+            // TODO: missing other conversions
+            match field.data_type() {
+                DataType::Float64 => SchemaDataType::primitive(String::from("double")),
+                _ => SchemaDataType::primitive(String::from("double")),
+            };
+        table_columns.push(
+            SchemaField::new(
+                field.name().to_owned(),
+                datatype,
+                field.is_nullable(),
+                Default::default(),
+            )
+        );
+    }
+
+    table_columns
 }
+
+// fn get_table_columns() -> Vec<SchemaField> {
+//     vec![
+//         SchemaField::new(
+//             String::from("id"),
+//             SchemaDataType::primitive(String::from("float")),
+//             false,
+//             Default::default(),
+//         ),
+//         // SchemaField::new(
+//         //      String::from("frequencia"),
+//         //      SchemaDataType::array(SchemaTypeArray::new(
+//         //          Box::new(SchemaDataType::primitive(String::from("double"))),
+//         //          true,
+//         //      )),
+//         //      true,
+//         //      Default::default(),
+//         //  ),
+//         //  SchemaField::new(
+//         //      String::from("sensor_id"),
+//         //      SchemaDataType::primitive(String::from("long")),
+//         //      false,
+//         //      Default::default(),
+//         //  ),
+//         //  SchemaField::new(
+//         //      String::from("ciclo"),
+//         //      SchemaDataType::primitive(String::from("long")),
+//         //      false,
+//         //      Default::default(),
+//         //  ),
+//         //  SchemaField::new(
+//         //      String::from("execucao_ciclo_id"),
+//         //      SchemaDataType::primitive(String::from("long")),
+//         //      false,
+//         //      Default::default(),
+//         //  ),
+//         //  SchemaField::new(
+//         //      String::from("repeticao"),
+//         //      SchemaDataType::primitive(String::from("long")),
+//         //      false,
+//         //      Default::default(),
+//         //  ),
+//         //  SchemaField::new(
+//         //      String::from("data_hora"),
+//         //      SchemaDataType::primitive(String::from("timestamp")),
+//         //      false,
+//         //      Default::default(),
+//         //  ),
+//     ]
+// }
 
 /// Creates a new client connected to the `anna-rs` key-value store.
 async fn new_anna_client(zenoh: Arc<zenoh::Session>) -> anyhow::Result<ClientNode> {
