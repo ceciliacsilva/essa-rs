@@ -9,15 +9,12 @@ use anna::{
 };
 use anyhow::Context;
 use essa_common::{essa_default_zenoh_prefix, executor_run_r_subscribe_topic};
-use extendr_api::deserializer::from_robj;
 use extendr_api::prelude::*;
 use extendr_api::Robj;
 use r_polars::conversion_r_to_s::par_read_robjs;
 use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 use zenoh::prelude::r#async::*;
-
-use std::io::Write;
 
 /// Starts a essa R executor.
 ///
@@ -143,6 +140,7 @@ async fn r_executor(
                         .iter()
                         .map(|r_dataframe| r_dataframe.to_list_result().unwrap().into())
                         .collect();
+                    log::info!("r list: {:?}", r_lists);
 
                     let function = String::from_utf8(func)?;
                     let func: Robj = eval_string(&function).unwrap();
@@ -162,6 +160,8 @@ async fn r_executor(
 
                     let result = func.call(Pairlist::from_pairs(arguments_pairlist)).unwrap();
 
+                    // this not enough if the response is a dataframe, because it will be the
+                    // most generic type possible.
                     final_result =
                         match result.rtype() {
                             Rtype::Integers => convert_from_robj_integer_to_polars(result)?,

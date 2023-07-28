@@ -253,8 +253,16 @@ pub async fn save_to_deltalake_loop(
                 let arrow_schema = ArrowSchema::new(schema_vec.clone());
                 let mut array_ref_columns = vec![];
                 for dataframe in &dataframes {
-                    for column_name in dataframe.get_column_names() {
-                        array_ref_columns.push(convert_between_arrow_formats(&dataframe, column_name));
+                    for column in dataframe.get_columns() {
+                        let ctype = column.dtype();
+                        println!("{:?}", ctype);
+                        if ctype.is_float() {
+                            array_ref_columns.push(convert_between_arrow_formats_float(&dataframe, column.name()));
+                        } else if ctype.is_integer() {
+                            array_ref_columns.push(convert_between_arrow_formats_int(&dataframe, column.name()));
+                        } else {
+                            array_ref_columns.push(convert_between_arrow_formats_float(&dataframe, column.name()));
+                        }
                     }
                 }
 
@@ -298,7 +306,7 @@ pub async fn save_to_deltalake_loop(
     Ok(())
 }
 
-fn convert_between_arrow_formats(
+fn convert_between_arrow_formats_int(
     from_polars: &DataFrame,
     column_name: &str,
 ) -> deltalake::arrow::array::ArrayRef {
@@ -306,7 +314,27 @@ fn convert_between_arrow_formats(
         .column(column_name)
         .expect(&format!("{:?} not found in {:?}", column_name, from_polars))
         .chunks();
-    //println!("{:?}", chunked_array);
+    let mut data = vec![];
+    for chunk in chunked_array {
+        let array = chunk
+            .as_any()
+            .downcast_ref::<r_polars::polars::export::arrow::array::Int64Array>();
+        for a in array.unwrap() {
+            data.push(a.unwrap().clone());
+        }
+    }
+
+    Arc::new(deltalake::arrow::array::Int64Array::from(data))
+}
+
+fn convert_between_arrow_formats_float(
+    from_polars: &DataFrame,
+    column_name: &str,
+) -> deltalake::arrow::array::ArrayRef {
+    let chunked_array = from_polars
+        .column(column_name)
+        .expect(&format!("{:?} not found in {:?}", column_name, from_polars))
+        .chunks();
     let mut data = vec![];
     for chunk in chunked_array {
         let array = chunk
@@ -374,56 +402,6 @@ fn get_table_columns(schema_vec: Vec<Field>) -> Vec<SchemaField> {
 
     table_columns
 }
-
-// fn get_table_columns() -> Vec<SchemaField> {
-//     vec![
-//         SchemaField::new(
-//             String::from("id"),
-//             SchemaDataType::primitive(String::from("float")),
-//             false,
-//             Default::default(),
-//         ),
-//         // SchemaField::new(
-//         //      String::from("frequencia"),
-//         //      SchemaDataType::array(SchemaTypeArray::new(
-//         //          Box::new(SchemaDataType::primitive(String::from("double"))),
-//         //          true,
-//         //      )),
-//         //      true,
-//         //      Default::default(),
-//         //  ),
-//         //  SchemaField::new(
-//         //      String::from("sensor_id"),
-//         //      SchemaDataType::primitive(String::from("long")),
-//         //      false,
-//         //      Default::default(),
-//         //  ),
-//         //  SchemaField::new(
-//         //      String::from("ciclo"),
-//         //      SchemaDataType::primitive(String::from("long")),
-//         //      false,
-//         //      Default::default(),
-//         //  ),
-//         //  SchemaField::new(
-//         //      String::from("execucao_ciclo_id"),
-//         //      SchemaDataType::primitive(String::from("long")),
-//         //      false,
-//         //      Default::default(),
-//         //  ),
-//         //  SchemaField::new(
-//         //      String::from("repeticao"),
-//         //      SchemaDataType::primitive(String::from("long")),
-//         //      false,
-//         //      Default::default(),
-//         //  ),
-//         //  SchemaField::new(
-//         //      String::from("data_hora"),
-//         //      SchemaDataType::primitive(String::from("timestamp")),
-//         //      false,
-//         //      Default::default(),
-//         //  ),
-//     ]
-// }
 
 /// Creates a new client connected to the `anna-rs` key-value store.
 async fn new_anna_client(zenoh: Arc<zenoh::Session>) -> anyhow::Result<ClientNode> {
