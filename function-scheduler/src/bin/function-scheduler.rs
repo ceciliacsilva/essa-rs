@@ -136,6 +136,7 @@ async fn call_function(
 
         let reply = zenoh
             .get(topic)
+            .timeout(std::time::Duration::from_secs(20))
             .res()
             .await
             .expect("failed to forward function call to executor")
@@ -198,6 +199,7 @@ async fn call_r_function(
 
         let reply = zenoh
             .get(topic)
+            .timeout(std::time::Duration::from_secs(20))
             .res()
             .await
             .expect("failed to forward r function call to executor")

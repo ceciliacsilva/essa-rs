@@ -122,6 +122,7 @@ impl FunctionExecutor {
                 .res()
                 .await
                 .map_err(|e| {
+                    println!("Error reply function run");
                     let err = Box::<dyn std::error::Error + 'static + Send + Sync>::from(e);
                     anyhow::anyhow!(err)
                 })?;
@@ -568,10 +569,7 @@ fn essa_deltalake_save_wrapper(
         data
     };
 
-    match caller
-        .data_mut()
-        .essa_deltalake_save(table_path, args)
-    {
+    match caller.data_mut().essa_deltalake_save(table_path, args) {
         Ok(result) => {
             let host_state = caller.data_mut();
             let handle = host_state.next_result_handle;
@@ -1092,6 +1090,7 @@ async fn call_function_extern(
     // send the request to the scheduler node
     let reply = zenoh
         .get(topic)
+        .timeout(std::time::Duration::from_secs(20))
         .res()
         .await
         .map_err(|e| anyhow::anyhow!(e))
@@ -1112,6 +1111,7 @@ async fn run_r_extern(
     // send the request to the scheduler node
     let reply = zenoh
         .get(topic)
+        .timeout(std::time::Duration::from_secs(20))
         .res()
         .await
         .map_err(|e| anyhow::anyhow!(e))
@@ -1130,6 +1130,7 @@ async fn datafusion_run_extern(
 
     let reply = zenoh
         .get(topic)
+        .timeout(std::time::Duration::from_secs(20))
         .res()
         .await
         .map_err(|e| anyhow::anyhow!(e))
@@ -1148,6 +1149,7 @@ async fn deltalake_save_extern(
 
     let reply = zenoh
         .get(topic)
+        .timeout(std::time::Duration::from_secs(20))
         .res()
         .await
         .map_err(|e| anyhow::anyhow!(e))

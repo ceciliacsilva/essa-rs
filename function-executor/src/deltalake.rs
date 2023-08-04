@@ -6,6 +6,7 @@ use anna::{
     ClientKey,
 };
 use anyhow::Context;
+use arrow_array::GenericListArray;
 use essa_common::essa_default_zenoh_prefix;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -19,15 +20,15 @@ use deltalake::{
         datatypes::{DataType, Field, Schema as ArrowSchema},
         record_batch::RecordBatch,
     },
-    DeltaOps, DeltaTable, SchemaDataType, SchemaField,
+    DeltaOps, DeltaTable, SchemaDataType, SchemaField, SchemaTypeArray,
 };
 use parquet::file::properties::WriterProperties;
 use polars_sql::SQLContext;
 use r_polars::polars::prelude::*;
 use std::path::Path;
 
-use sqlparser::{dialect::GenericDialect, ast::TableWithJoins};
 use sqlparser::parser::Parser;
+use sqlparser::{ast::TableWithJoins, dialect::GenericDialect};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -100,6 +101,7 @@ pub async fn polars_loop(zenoh: Arc<zenoh::Session>, _zenoh_prefix: &str) -> any
 
                 let delta_table_path = String::from_utf8(delta_table_path)?;
 
+                println!("delta table path: {:?}", delta_table_path);
                 let mut ctx = SQLContext::new();
                 let table = deltalake::open_table(delta_table_path.clone())
                     .await
@@ -119,28 +121,38 @@ pub async fn polars_loop(zenoh: Arc<zenoh::Session>, _zenoh_prefix: &str) -> any
                 }
 
                 let lazy_frame = diag_concat_lf(&dfs, false, false)?;
+                println!("lazy frame: {:?}", lazy_frame.clone().collect().unwrap());
 
                 let sql_query = String::from_utf8(sql_query)?;
                 let dialect = &GenericDialect;
                 let select = Parser::new(dialect)
                     .try_with_sql(&sql_query)?
                     .parse_select()?;
-                let table_name =
-                    match select.from.get(0) {
-                        Some(TableWithJoins { relation, joins: _j }) => relation.to_string(),
-                        _ => {
-                            log::info!("Could not a Table name");
-                            "demo".to_string()
-                        },
-                    };
+                //println!("select from get {:?}", select.from);
+                // TODO: figure out why this only works for `SELECT <cols> FROM X`
+                // and not for `SELECT * FROM X`.
+                println!("query: {:?}", sql_query);
+                println!("select: {:?}", select);
+                let table_name = match select.from.get(0) {
+                    Some(TableWithJoins {
+                        relation,
+                        joins: _j,
+                    }) => {
+                        relation.to_string()
+                    },
+                    _ => {
+                        log::info!("Could not a Table name from sql. Table will be filename");
+                        let filename = delta_table_path.split("/").last().unwrap();
+                        filename.to_string()
+                    }
+                };
 
-                // TODO: has to be `table` name, comming from query.
                 ctx.register(&table_name, lazy_frame);
 
                 let result: r_polars::polars::prelude::DataFrame =
                     ctx.execute(&sql_query).unwrap().collect().unwrap();
 
-                log::debug!("SQL execute result: {:?}", result);
+                println!("SQL execute result: {:?}", result);
 
                 let serialized_result = bincode::serialize(&result)?;
 
@@ -219,7 +231,8 @@ pub async fn save_to_deltalake_loop(
                 let args_from_anna_vec: Vec<Vec<u8>> = args_vec
                     .iter()
                     .map(|arg| {
-                        arg.clone().into_lww()
+                        arg.clone()
+                            .into_lww()
                             .map_err(eyre_to_anyhow)
                             .context("args is not a LWW lattice")
                             .unwrap()
@@ -233,20 +246,48 @@ pub async fn save_to_deltalake_loop(
                     .map(|args_from_anna| bincode::deserialize(&args_from_anna).unwrap())
                     .collect();
 
+                print!("to save dataframes: {:?}", dataframes);
+
                 let mut schema_vec = vec![];
 
                 for (i, dataframe) in dataframes.iter().enumerate() {
-                    for schema in dataframe.fields() {
-                        let schema = schema.to_arrow();
-                        let data_type =
-                            // TODO: missing other conversions.
-                            match schema.data_type {
-                                ArrowDataType::Float64 => DataType::Float64,
-                                ArrowDataType::Int32 => DataType::Int32,
-                                _ => DataType::Float64,
-                            };
+                    let (col, _line) = dataframe.shape();
+                    if col == 1 {
+                        for field in dataframe.fields() {
+                            let schema = field.to_arrow();
+                            let data_type =
+                                // TODO: missing other conversions.
+                                match schema.data_type {
+                                    ArrowDataType::Float64 => DataType::Float64,
+                                    ArrowDataType::Int32 => DataType::Int32,
+                                    _ => DataType::Float64,
+                                };
 
-                        schema_vec.push(Field::new(format!("{}-{}", schema.name, i), data_type, schema.is_nullable));
+                            schema_vec.push(Field::new(
+                                format!("col{}{}", schema.name, i),
+                                data_type,
+                                schema.is_nullable,
+                            ));
+                        }
+                    } else {
+                        for field in dataframe.fields() {
+                            let schema = field.to_arrow();
+                            let data_type =
+                                // TODO: missing other conversions.
+                                match schema.data_type {
+                                    ArrowDataType::Float64 => DataType::Float64,
+                                    ArrowDataType::Int32 => DataType::Int32,
+                                    _ => DataType::Float64,
+                                };
+
+                            schema_vec.push(Field::new(
+                                format!("col{}{}", schema.name, i),
+                                DataType::List(
+                                    Field::new("item", data_type, schema.is_nullable).into(),
+                                ),
+                                schema.is_nullable,
+                            ));
+                        }
                     }
                 }
 
@@ -255,26 +296,50 @@ pub async fn save_to_deltalake_loop(
                 for dataframe in &dataframes {
                     for column in dataframe.get_columns() {
                         let ctype = column.dtype();
-                        println!("{:?}", ctype);
+
                         if ctype.is_float() {
-                            array_ref_columns.push(convert_between_arrow_formats_float(&dataframe, column.name()));
+                            if column.len() == 1 {
+                                array_ref_columns.push(convert_between_arrow_formats_float(
+                                    &dataframe,
+                                    column.name(),
+                                ));
+                            } else {
+                                array_ref_columns.push(convert_between_arrow_formats_list_float(
+                                    &dataframe,
+                                    column.name(),
+                                ));
+                            }
                         } else if ctype.is_integer() {
-                            array_ref_columns.push(convert_between_arrow_formats_int(&dataframe, column.name()));
+                            if column.len() == 1 {
+                                array_ref_columns.push(convert_between_arrow_formats_int(
+                                    &dataframe,
+                                    column.name(),
+                                ));
+                            } else {
+                                array_ref_columns.push(convert_between_arrow_formats_list_int(
+                                    &dataframe,
+                                    column.name(),
+                                ));
+                            }
                         } else {
-                            array_ref_columns.push(convert_between_arrow_formats_float(&dataframe, column.name()));
+                            array_ref_columns.push(convert_between_arrow_formats_list_float(
+                                &dataframe,
+                                column.name(),
+                            ));
                         }
                     }
                 }
 
-                let batch = RecordBatch::try_new(Arc::new(arrow_schema), array_ref_columns).unwrap();
+                let batch =
+                    RecordBatch::try_new(Arc::new(arrow_schema), array_ref_columns).unwrap();
 
                 let delta_table_path = String::from_utf8(delta_table_path)?;
 
                 let table_dir = Path::new(&delta_table_path);
-                log::info!("table_dir: {:?}", table_dir);
+                println!("table_dir: {:?}", table_dir);
                 let table_name = table_dir.file_name().unwrap().to_str().unwrap();
-                log::info!("table_name: {:?}", table_name);
-                let comment = "A table with median resistence shm";
+                println!("table_name: {:?}", table_name);
+                let comment = "A table";
                 let table = create_or_open_delta_table(table_dir, table_name, comment, schema_vec)
                     .await
                     .unwrap();
@@ -288,6 +353,7 @@ pub async fn save_to_deltalake_loop(
 
                 log::info!("table: {:?}", table);
 
+                // TODO: think about what should be returned
                 let serialized_result = bincode::serialize("oi").unwrap();
 
                 query
@@ -295,7 +361,6 @@ pub async fn save_to_deltalake_loop(
                     .res()
                     .await
                     .expect("failed to send sample back");
-                log::info!("Sending result back");
             }
             Err(e) => {
                 log::info!("zenoh error {e:?}");
@@ -318,13 +383,13 @@ fn convert_between_arrow_formats_int(
     for chunk in chunked_array {
         let array = chunk
             .as_any()
-            .downcast_ref::<r_polars::polars::export::arrow::array::Int64Array>();
+            .downcast_ref::<r_polars::polars::export::arrow::array::Int32Array>();
         for a in array.unwrap() {
             data.push(a.unwrap().clone());
         }
     }
 
-    Arc::new(deltalake::arrow::array::Int64Array::from(data))
+    Arc::new(deltalake::arrow::array::Int32Array::from(data))
 }
 
 fn convert_between_arrow_formats_float(
@@ -346,6 +411,63 @@ fn convert_between_arrow_formats_float(
     }
 
     Arc::new(deltalake::arrow::array::Float64Array::from(data))
+}
+
+fn convert_between_arrow_formats_list_float(
+    from_polars: &DataFrame,
+    column_name: &str,
+) -> deltalake::arrow::array::ArrayRef {
+    let chunked_array = from_polars
+        .column(column_name)
+        .expect(&format!("{:?} not found in {:?}", column_name, from_polars))
+        .chunks();
+    let mut data: Vec<Option<f64>> = vec![];
+    for chunk in chunked_array {
+        println!("chunk: {:?}", chunk);
+        let array = chunk
+            .as_any()
+            .downcast_ref::<r_polars::polars::export::arrow::array::Float64Array>();
+        println!("array: {:?}", array);
+        for a in array.unwrap() {
+            // XXX: sadly I need to unwrap a and then make it optional again because
+            // a = `Option<&f64>`.
+            data.push(Some(a.unwrap().clone()));
+        }
+    }
+
+    let list_array: GenericListArray<i32> = deltalake::arrow::array::ListArray::from_iter_primitive::<
+        arrow_array::types::Float64Type,
+        _,
+        _,
+    >([Some(data)]);
+    Arc::new(list_array)
+}
+
+fn convert_between_arrow_formats_list_int(
+    from_polars: &DataFrame,
+    column_name: &str,
+) -> deltalake::arrow::array::ArrayRef {
+    let chunked_array = from_polars
+        .column(column_name)
+        .expect(&format!("{:?} not found in {:?}", column_name, from_polars))
+        .chunks();
+    let mut data: Vec<Option<i32>> = vec![];
+    for chunk in chunked_array {
+        let array = chunk
+            .as_any()
+            .downcast_ref::<r_polars::polars::export::arrow::array::Int32Array>();
+        for a in array.unwrap() {
+            // XXX: sadly I need to unwrap a and then make it optional again because
+            // a = `Option<&f64>`.
+            data.push(Some(a.unwrap().clone()));
+        }
+    }
+    let list_array: GenericListArray<i32> = deltalake::arrow::array::ListArray::from_iter_primitive::<
+        arrow_array::types::Int32Type,
+        _,
+        _,
+    >([Some(data)]);
+    Arc::new(list_array)
 }
 
 async fn create_or_open_delta_table(
@@ -388,16 +510,23 @@ fn get_table_columns(schema_vec: Vec<Field>) -> Vec<SchemaField> {
             // TODO: missing other conversions
             match field.data_type() {
                 DataType::Float64 => SchemaDataType::primitive(String::from("double")),
-                _ => SchemaDataType::primitive(String::from("double")),
+                DataType::Int32 => SchemaDataType::primitive(String::from("integer")),
+                DataType::List(f) if f.data_type() == &DataType::Float64 => SchemaDataType::array(SchemaTypeArray::new(
+                    Box::new(SchemaDataType::primitive(String::from("double"))),
+                    true,
+                )),
+                DataType::List(f) if f.data_type() == &DataType::Int32 => SchemaDataType::array(SchemaTypeArray::new(
+                    Box::new(SchemaDataType::primitive(String::from("integer"))),
+                    true,
+                )),
+                _ => SchemaDataType::primitive(String::from("integer")),
             };
-        table_columns.push(
-            SchemaField::new(
-                field.name().to_owned(),
-                datatype,
-                field.is_nullable(),
-                Default::default(),
-            )
-        );
+        table_columns.push(SchemaField::new(
+            field.name().to_owned(),
+            datatype,
+            field.is_nullable(),
+            Default::default(),
+        ));
     }
 
     table_columns

@@ -134,13 +134,13 @@ async fn r_executor(
                         .iter()
                         .map(|dataframe| (*dataframe).clone().into())
                         .collect();
-                    log::info!("dataframes: {:?}", r_dataframes);
+                    println!("dataframes: {:?}", r_dataframes);
 
                     let r_lists: Vec<r_polars::Robj> = r_dataframes
                         .iter()
                         .map(|r_dataframe| r_dataframe.to_list_result().unwrap().into())
                         .collect();
-                    log::info!("r list: {:?}", r_lists);
+                    //log::info!("r list: {:?}", r_lists);
 
                     let function = String::from_utf8(func)?;
                     let func: Robj = eval_string(&function).unwrap();
@@ -158,16 +158,20 @@ async fn r_executor(
                         }
                     }
 
-                    let result = func.call(Pairlist::from_pairs(arguments_pairlist)).unwrap();
+                    let result: Robj = func.call(Pairlist::from_pairs(arguments_pairlist)).unwrap();
 
                     // this not enough if the response is a dataframe, because it will be the
                     // most generic type possible.
+                    println!("result rtype: {:?}", result.rtype());
                     final_result =
                         match result.rtype() {
-                            Rtype::Integers => convert_from_robj_integer_to_polars(result)?,
                             Rtype::Doubles => convert_from_robj_real_to_polars(result)?,
+                            Rtype::Integers => convert_from_robj_integer_to_polars(result)?,
                             // TODO: error handling
-                            _ => vec![],
+                            _ => {
+                                println!("Return type not suported");
+                                convert_from_robj_integer_to_polars(r!(vec![1, 2]))?
+                            },
                         };
                 }
 
@@ -213,6 +217,8 @@ fn convert_from_robj_integer_to_polars(result: Robj) -> anyhow::Result<Vec<r_pol
 }
 
 fn convert_from_robj_real_to_polars(result: Robj) -> anyhow::Result<Vec<r_polars::polars::prelude::Series>> {
+    println!("result dim: {:?}", result.dim());
+    println!("result len: {:?}", result.len());
     let mut results = result.as_real_slice().unwrap().chunks_exact(result.len());
     if let Some(dim) = result.dim() {
         match dim.iter().collect::<Vec<_>>().as_slice() {
