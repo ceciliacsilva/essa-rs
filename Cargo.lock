@@ -1915,6 +1915,7 @@ dependencies = [
  "anna",
  "anyhow",
  "argh",
+ "arrow-array 42.0.0",
  "bincode",
  "chrono",
  "deltalake",
@@ -5760,9 +5761,9 @@ dependencies = [
 
 [[package]]
 name = "wasmedge-types"
-version = "0.4.1"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aab1f57fd27746277379ab012475fa77679f91cc3bec1fa7b09b1628c5fb0339"
+checksum = "805d19a94fc0f380a0d034095b629442dec8951cde05044ebafa811cb98ee7a4"
 dependencies = [
  "thiserror",
  "wat",
