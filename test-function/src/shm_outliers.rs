@@ -66,21 +66,45 @@ function(metric_vector) {
 "
 }
 
-#[essa_wrap(name = "rm_outliers_extern")]
-pub fn rm_outliers(pzt_id: u64, cycle: u64) -> bool {
-    let pzt_batch_measures = essa_api::datafusion_run(
+#[essa_wrap(name = "get_pzt_batch")]
+pub fn get_pzt_batch_measures(pzt_id: u64, cycle: u64) -> Option<ResultHandle> {
+    let a = essa_api::datafusion_run(
         &format!("SELECT sensor_id, resistencia, frequencia, temperatura, ciclo FROM aquisicoes WHERE sensor_id={} AND ciclo={}", pzt_id, cycle),
         "/home/ceciliacsilva/Desktop/delta-rs/pzt13",
+    );
+    println!("batch = {:?}", a);
+
+    let pzt_batch_measures = a.unwrap();
+    let sensor_id = essa_api::run_r(
+        "function(pzt_batch_measures){
+            return(pzt_batch_measures$sensor_id[[1]])
+}",
+        &[pzt_batch_measures.get_key()],
     )
     .unwrap();
 
+    let _ = deltalake_save(
+        "/home/ceciliacsilva/Desktop/delta-rs/teste-dentro-funcao",
+        &[
+            sensor_id.get_key(),
+        ],
+    )
+    .unwrap();
+
+    Some(pzt_batch_measures)
+}
+
+#[essa_wrap(name = "rm_outliers_extern")]
+pub fn rm_outliers(pzt_batch_measures: ResultHandle) -> bool {
     println!("Running shm outliers removal!");
+
+    println!("handle pzt_batch_measures: {:?}", pzt_batch_measures);
 
     let sensor_id = essa_api::run_r(
         "function(pzt_batch_measures){
             return(pzt_batch_measures$sensor_id[[1]])
 }",
-        &[pzt_batch_measures.0],
+        &[pzt_batch_measures.get_key()],
     )
     .unwrap();
 
@@ -88,7 +112,7 @@ pub fn rm_outliers(pzt_id: u64, cycle: u64) -> bool {
         "function(pzt_batch_measures){
             return(pzt_batch_measures$ciclo[[1]])
 }",
-        &[pzt_batch_measures.0],
+        &[pzt_batch_measures.get_key()],
     )
     .unwrap();
 
@@ -96,7 +120,7 @@ pub fn rm_outliers(pzt_id: u64, cycle: u64) -> bool {
         "function(pzt_batch_measures){
             return(length(pzt_batch_measures$resistencia))
 }",
-        &[pzt_batch_measures.0],
+        &[pzt_batch_measures.get_key()],
     )
     .unwrap();
 
@@ -104,7 +128,7 @@ pub fn rm_outliers(pzt_id: u64, cycle: u64) -> bool {
         "function(pzt_batch_measures){
             return(length(pzt_batch_measures$frequencia[[1]]))
 }",
-        &[pzt_batch_measures.0],
+        &[pzt_batch_measures.get_key()],
     )
     .unwrap();
 
@@ -112,39 +136,52 @@ pub fn rm_outliers(pzt_id: u64, cycle: u64) -> bool {
         "function(pzt_batch_measures){
             return(median(pzt_batch_measures$temperatura))
 }",
-        &[pzt_batch_measures.0],
+        &[pzt_batch_measures.get_key()],
     )
     .unwrap();
 
     let measure_matrix = essa_api::run_r(
         to_measure_matrix(),
-        &[pzt_batch_measures.0, batch_size.0, frequency_points_qnt.0],
+        &[
+            pzt_batch_measures.get_key(),
+            batch_size.get_key(),
+            frequency_points_qnt.get_key(),
+        ],
     )
     .unwrap();
 
     let median_impedance_r = essa_api::run_r(
         to_median_impedance(),
-        &[measure_matrix.0, batch_size.0, frequency_points_qnt.0],
+        &[
+            measure_matrix.get_key(),
+            batch_size.get_key(),
+            frequency_points_qnt.get_key(),
+        ],
     )
     .unwrap();
 
     let metric_vector = essa_api::run_r(
         metric_calculation(),
         &[
-            measure_matrix.0,
-            median_impedance_r.0,
-            batch_size.0,
-            frequency_points_qnt.0,
+            measure_matrix.get_key(),
+            median_impedance_r.get_key(),
+            batch_size.get_key(),
+            frequency_points_qnt.get_key(),
         ],
     )
     .unwrap();
 
-    let outliers_position = essa_api::run_r(outliers_positions(), &[metric_vector.0]).unwrap();
+    let outliers_position =
+        essa_api::run_r(outliers_positions(), &[metric_vector.get_key()]).unwrap();
 
     // TODO: this should be better.
     let _ = deltalake_save(
         "/home/ceciliacsilva/Desktop/delta-rs/metric-vector",
-        &[metric_vector.0, cycle.0, sensor_id.0],
+        &[
+            metric_vector.get_key(),
+            cycle.get_key(),
+            sensor_id.get_key(),
+        ],
     )
     .unwrap();
 
@@ -152,10 +189,10 @@ pub fn rm_outliers(pzt_id: u64, cycle: u64) -> bool {
     let _ = deltalake_save(
         "/home/ceciliacsilva/Desktop/delta-rs/median",
         &[
-            median_impedance_r.0,
-            sensor_id.0,
-            cycle.0,
-            temperature_median.0,
+            median_impedance_r.get_key(),
+            sensor_id.get_key(),
+            cycle.get_key(),
+            temperature_median.get_key(),
         ],
     )
     .unwrap();
@@ -163,9 +200,14 @@ pub fn rm_outliers(pzt_id: u64, cycle: u64) -> bool {
     // TODO: this should be better.
     let _ = deltalake_save(
         "/home/ceciliacsilva/Desktop/delta-rs/outliers",
-        &[outliers_position.0, cycle.0, sensor_id.0],
+        &[
+            outliers_position.get_key(),
+            cycle.get_key(),
+            sensor_id.get_key(),
+        ],
     )
     .unwrap();
 
+    println!("Done removing outliers");
     true
 }

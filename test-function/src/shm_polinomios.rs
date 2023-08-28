@@ -45,7 +45,7 @@ fn calc_coef() -> &'static str {
      }
 
   k=1:l
-  c1=rep(0.05,l)
+  c1=rep(0.get_key()5,l)
   c2=rep(0.7,l)
 
   dados=data.frame(k,pressupostos,r2)
@@ -83,7 +83,7 @@ fn calc_coef() -> &'static str {
 }
 
 fn calc_ccd_bas() -> &'static str {
-"function(x, coeficientes, matriz, l, qnt_medidas) {
+    "function(x, coeficientes, matriz, l, qnt_medidas) {
   l <- unlist(l)[[1]]
   qnt_medidas <- unlist(qnt_medidas)[[1]]
   x <- matrix(unlist(x), nrow=qnt_medidas)
@@ -94,20 +94,23 @@ fn calc_ccd_bas() -> &'static str {
 "
 }
 
-#[essa_wrap(name = "polinomios_extern")]
-pub fn polinomios(pzt_id: u64, _cycles: Vec<u64>) -> bool {
-    let pzt_medianas = essa_api::datafusion_run(
+#[essa_wrap(name = "get_median")]
+pub fn median(pzt_id: u64) -> Option<ResultHandle> {
+    let a = essa_api::datafusion_run(
         &format!("SELECT col00 as r, col01 as sensor_id, col02 as ciclo, col03 as temperatura FROM median WHERE col01 = {}", pzt_id),
         "/home/ceciliacsilva/Desktop/delta-rs/median",
-    )
-    .unwrap();
+    );
+    println!("a = {:?}", a);
+    a.ok()
+}
 
-
+#[essa_wrap(name = "polinomios_extern")]
+pub fn polinomios(pzt_medianas: ResultHandle) -> bool {
     let sensor_id = essa_api::run_r(
         "function(pzt_medianas){
             return(pzt_medianas$sensor_id[[1]])
 }",
-        &[pzt_medianas.0],
+        &[pzt_medianas.get_key()],
     )
     .unwrap();
 
@@ -115,7 +118,7 @@ pub fn polinomios(pzt_id: u64, _cycles: Vec<u64>) -> bool {
         "function(pzt_medianas){
             return(length(pzt_medianas$r[[1]]))
 }",
-        &[pzt_medianas.0],
+        &[pzt_medianas.get_key()],
     )
     .unwrap();
 
@@ -124,7 +127,7 @@ pub fn polinomios(pzt_id: u64, _cycles: Vec<u64>) -> bool {
             l <- unlist(l)[[1]]
             return(matrix(unlist(pzt_medianas$r), nrow=l))
 }",
-        &[pzt_medianas.0, l.0],
+        &[pzt_medianas.get_key(), l.get_key()],
     )
     .unwrap();
 
@@ -132,7 +135,7 @@ pub fn polinomios(pzt_id: u64, _cycles: Vec<u64>) -> bool {
         "function(pzt_medianas){
             return(length(pzt_medianas$temp))
 }",
-        &[pzt_medianas.0],
+        &[pzt_medianas.get_key()],
     )
     .unwrap();
 
@@ -140,13 +143,16 @@ pub fn polinomios(pzt_id: u64, _cycles: Vec<u64>) -> bool {
         "function(pzt_medianas){
             return(pzt_medianas$temperatura)
 }",
-        &[pzt_medianas.0],
+        &[pzt_medianas.get_key()],
     )
     .unwrap();
 
     // XXX: is weird but the ordering is right like this.
-    let matrix =
-        essa_api::run_r(to_measure_matrix(), &[pzt_medianas_r.0, l.0, qnt_medidas.0]).unwrap();
+    let matrix = essa_api::run_r(
+        to_measure_matrix(),
+        &[pzt_medianas_r.get_key(), l.get_key(), qnt_medidas.get_key()],
+    )
+    .unwrap();
 
     let mediana2 = essa_api::run_r(
         "function(pzt_medianas, l, qnt_medidas) {
@@ -160,23 +166,27 @@ pub fn polinomios(pzt_id: u64, _cycles: Vec<u64>) -> bool {
             return(medianas2)
 }
 ",
-        &[pzt_medianas.0, l.0, qnt_medidas.0],
+        &[pzt_medianas.get_key(), l.get_key(), qnt_medidas.get_key()],
     )
     .unwrap();
 
     let coef = essa_api::run_r(
         calc_coef(),
-        &[matrix.0, mediana2.0, x.0, l.0, qnt_medidas.0],
+        &[
+            matrix.get_key(),
+            mediana2.get_key(),
+            x.get_key(),
+            l.get_key(),
+            qnt_medidas.get_key(),
+        ],
     )
     .unwrap();
 
     let _pol = essa_api::deltalake_save(
         "/home/ceciliacsilva/Desktop/delta-rs/coef_collection",
-        &[sensor_id.0, x.0, coef.0],
+        &[sensor_id.get_key(), x.get_key(), coef.get_key()],
     )
     .unwrap();
-
-    // println!("Running shm polinomios!");
 
     true
 }

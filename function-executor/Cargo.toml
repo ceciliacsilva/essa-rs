@@ -32,6 +32,8 @@ r_polars = { path = "/home/ceciliacsilva/external-projects/r-polars/src/rust" }
 polars-sql = { path = "/home/ceciliacsilva/external-projects/polars/polars/polars-sql" }
 parquet = "42.0.0"
 sqlparser = "0.35"
+arrow-array = { version = "42" }
+lazy_static = "1.4.0"
 
 [features]
 default = ["wasmtime_executor"]

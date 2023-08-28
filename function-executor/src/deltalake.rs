@@ -1,5 +1,6 @@
 use anna::{
     anna_default_zenoh_prefix,
+    lattice::LastWriterWinsLattice,
     nodes::{request_cluster_info, ClientNode},
     store::LatticeValue,
     topics::RoutingThread,
@@ -25,13 +26,20 @@ use deltalake::{
 use parquet::file::properties::WriterProperties;
 use polars_sql::SQLContext;
 use r_polars::polars::prelude::*;
-use std::path::Path;
-
 use sqlparser::parser::Parser;
 use sqlparser::{ast::TableWithJoins, dialect::GenericDialect};
+use std::path::Path;
+use std::time::Instant;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if let Err(err) = set_up_logger() {
+        eprintln!(
+            "ERROR: {:?}",
+            anyhow::anyhow!(err).context("Failed to set up logget")
+        );
+    }
+
     let zenoh = Arc::new(
         zenoh::open(zenoh::config::Config::default())
             .res()
@@ -53,7 +61,11 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let _ = polars_loop(zenoh, &zenoh_prefix).await;
+    loop {
+        if let Err(err) = polars_loop(zenoh.clone(), &zenoh_prefix).await {
+            log::error!("Error while reading table: {:?}", err);
+        }
+    }
 
     Ok(())
 }
@@ -69,10 +81,10 @@ pub async fn polars_loop(zenoh: Arc<zenoh::Session>, _zenoh_prefix: &str) -> any
         .map_err(|e| anyhow::anyhow!(e))
         .context("failed to send function call request to scheduler")?;
 
-    let mut anna_client = new_anna_client(zenoh).await.unwrap();
+    let mut anna_client = new_anna_client(zenoh).await?;
 
     loop {
-        match reply.recv_async().await {
+        match
             Ok(query) => {
                 let mut topic_split = query.key_expr().as_str().split('/');
                 let delta_table_key: String = topic_split
@@ -103,9 +115,7 @@ pub async fn polars_loop(zenoh: Arc<zenoh::Session>, _zenoh_prefix: &str) -> any
 
                 println!("delta table path: {:?}", delta_table_path);
                 let mut ctx = SQLContext::new();
-                let table = deltalake::open_table(delta_table_path.clone())
-                    .await
-                    .unwrap();
+                let table = deltalake::open_table(delta_table_path.clone()).await?;
 
                 println!("{:?}", table.get_files());
 
@@ -121,7 +131,6 @@ pub async fn polars_loop(zenoh: Arc<zenoh::Session>, _zenoh_prefix: &str) -> any
                 }
 
                 let lazy_frame = diag_concat_lf(&dfs, false, false)?;
-                println!("lazy frame: {:?}", lazy_frame.clone().collect().unwrap());
 
                 let sql_query = String::from_utf8(sql_query)?;
                 let dialect = &GenericDialect;
@@ -131,15 +140,13 @@ pub async fn polars_loop(zenoh: Arc<zenoh::Session>, _zenoh_prefix: &str) -> any
                 //println!("select from get {:?}", select.from);
                 // TODO: figure out why this only works for `SELECT <cols> FROM X`
                 // and not for `SELECT * FROM X`.
-                println!("query: {:?}", sql_query);
-                println!("select: {:?}", select);
+                log::info!("query: {:?}", sql_query);
+                log::info!("select: {:?}", select);
                 let table_name = match select.from.get(0) {
                     Some(TableWithJoins {
                         relation,
                         joins: _j,
-                    }) => {
-                        relation.to_string()
-                    },
+                    }) => relation.to_string(),
                     _ => {
                         log::info!("Could not a Table name from sql. Table will be filename");
                         let filename = delta_table_path.split("/").last().unwrap();
@@ -149,20 +156,30 @@ pub async fn polars_loop(zenoh: Arc<zenoh::Session>, _zenoh_prefix: &str) -> any
 
                 ctx.register(&table_name, lazy_frame);
 
-                let result: r_polars::polars::prelude::DataFrame =
-                    ctx.execute(&sql_query).unwrap().collect().unwrap();
+                let table: r_polars::polars::prelude::DataFrame =
+                    ctx.execute(&sql_query).unwrap().collect()?;
 
-                println!("SQL execute result: {:?}", result);
+                log::info!("Table: {:?}", table);
 
-                let serialized_result = bincode::serialize(&result)?;
+                let table_serialized = bincode::serialize(&table)?;
+                // store args in kvs
+                let key: ClientKey = Uuid::new_v4().to_string().into();
+                kvs_put(
+                    key.clone(),
+                    LastWriterWinsLattice::new_now(table_serialized.into()).into(),
+                    &mut anna_client,
+                )?;
+
+                let key_serialized = bincode::serialize(&key)?;
+                log::info!("key serialized: {:?}", key_serialized);
 
                 query
-                    .reply(Ok(Sample::new(query.key_expr().clone(), serialized_result)))
+                    .reply(Ok(Sample::new(query.key_expr().clone(), key_serialized)))
                     .res()
                     .await
-                    .expect("failed to send sample back");
+                    .expect("Failed to send the `reply` back");
 
-                log::info!("Sending result back");
+                log::info!("Sending Result back to {query.key_expr:?}");
             }
             Err(e) => {
                 log::info!("zenoh error {e:?}");
@@ -188,11 +205,12 @@ pub async fn save_to_deltalake_loop(
         .map_err(|e| anyhow::anyhow!(e))
         .context("failed to get `save to deltalake` calls")?;
 
-    let mut anna_client = new_anna_client(zenoh).await.unwrap();
+    let mut anna_client = new_anna_client(zenoh).await?;
 
     loop {
         match reply.recv_async().await {
             Ok(query) => {
+                println!("Got a `toSave` message");
                 let mut topic_split = query.key_expr().as_str().split('/');
                 let key_to_args: String = topic_split
                     .next_back()
@@ -213,11 +231,19 @@ pub async fn save_to_deltalake_loop(
                     .into_value();
 
                 let args_vec_key: Vec<ClientKey> = bincode::deserialize(&serialized_args_vec_key)?;
+                println!("vec of client keys: {:?}", args_vec_key);
 
                 let mut args_vec = vec![];
                 for args_key in args_vec_key {
+                    println!("args key: {:?}", args_key);
+                    println!(
+                        "kvs get: {:?}",
+                        kvs_get(args_key.clone().into(), &mut anna_client)
+                    );
                     args_vec.push(kvs_get(args_key.into(), &mut anna_client)?);
                 }
+
+                println!("args vec: {:?}", args_vec);
 
                 let delta_table = kvs_get(delta_table_key.into(), &mut anna_client)?;
 
@@ -229,10 +255,9 @@ pub async fn save_to_deltalake_loop(
                     .into_value();
 
                 let args_from_anna_vec: Vec<Vec<u8>> = args_vec
-                    .iter()
+                    .into_iter()
                     .map(|arg| {
-                        arg.clone()
-                            .into_lww()
+                        arg.into_lww()
                             .map_err(eyre_to_anyhow)
                             .context("args is not a LWW lattice")
                             .unwrap()
@@ -243,10 +268,11 @@ pub async fn save_to_deltalake_loop(
 
                 let dataframes: Vec<r_polars::polars::prelude::DataFrame> = args_from_anna_vec
                     .iter()
-                    .map(|args_from_anna| bincode::deserialize(&args_from_anna).unwrap())
+                    .map(|args_from_anna| {
+                        bincode::deserialize(&args_from_anna)
+                            .expect("Failed to deserialize dataframes")
+                    })
                     .collect();
-
-                print!("to save dataframes: {:?}", dataframes);
 
                 let mut schema_vec = vec![];
 
@@ -330,8 +356,7 @@ pub async fn save_to_deltalake_loop(
                     }
                 }
 
-                let batch =
-                    RecordBatch::try_new(Arc::new(arrow_schema), array_ref_columns).unwrap();
+                let batch = RecordBatch::try_new(Arc::new(arrow_schema), array_ref_columns)?;
 
                 let delta_table_path = String::from_utf8(delta_table_path)?;
 
@@ -340,24 +365,30 @@ pub async fn save_to_deltalake_loop(
                 let table_name = table_dir.file_name().unwrap().to_str().unwrap();
                 println!("table_name: {:?}", table_name);
                 let comment = "A table";
-                let table = create_or_open_delta_table(table_dir, table_name, comment, schema_vec)
-                    .await
-                    .unwrap();
+                let table =
+                    create_or_open_delta_table(table_dir, table_name, comment, schema_vec).await?;
+
                 // TODO: missing writer properties config.
                 let writer_properties = WriterProperties::builder().set_dictionary_enabled(true);
                 let table = DeltaOps(table)
                     .write(vec![batch])
                     .with_writer_properties(writer_properties.build())
-                    .await
-                    .unwrap();
+                    .await?;
 
                 log::info!("table: {:?}", table);
 
-                // TODO: think about what should be returned
-                let serialized_result = bincode::serialize("oi").unwrap();
+                let success_msg = "Table stored";
+                let key: ClientKey = Uuid::new_v4().to_string().into();
+                kvs_put(
+                    key.clone(),
+                    LastWriterWinsLattice::new_now(success_msg.as_bytes().into()).into(),
+                    &mut anna_client,
+                )?;
+
+                let key_serialized = bincode::serialize(success_msg)?;
 
                 query
-                    .reply(Ok(Sample::new(query.key_expr().clone(), serialized_result)))
+                    .reply(Ok(Sample::new(query.key_expr().clone(), key_serialized)))
                     .res()
                     .await
                     .expect("failed to send sample back");
@@ -371,114 +402,85 @@ pub async fn save_to_deltalake_loop(
     Ok(())
 }
 
-fn convert_between_arrow_formats_int(
-    from_polars: &DataFrame,
-    column_name: &str,
-) -> deltalake::arrow::array::ArrayRef {
-    let chunked_array = from_polars
-        .column(column_name)
-        .expect(&format!("{:?} not found in {:?}", column_name, from_polars))
-        .chunks();
-    let mut data = vec![];
-    for chunk in chunked_array {
-        let array = chunk
-            .as_any()
-            .downcast_ref::<r_polars::polars::export::arrow::array::Int32Array>();
-        for a in array.unwrap() {
-            data.push(a.unwrap().clone());
-        }
-    }
+macro_rules! convert_arrow_primitive {
+    ($name:ident, $arrow_type:ty, $deltalake_type:path) => {
+        fn $name(from_polars: &DataFrame, column_name: &str) -> deltalake::arrow::array::ArrayRef {
+            let chunked_array = from_polars
+                .column(column_name)
+                .expect(&format!("{:?} not found in {:?}", column_name, from_polars))
+                .chunks();
+            let mut data = vec![];
+            for chunk in chunked_array {
+                let array = chunk.as_any().downcast_ref::<$arrow_type>();
+                for a in array.unwrap() {
+                    data.push(a.unwrap().clone());
+                }
+            }
 
-    Arc::new(deltalake::arrow::array::Int32Array::from(data))
+            Arc::new($deltalake_type(data))
+        }
+    };
 }
 
-fn convert_between_arrow_formats_float(
-    from_polars: &DataFrame,
-    column_name: &str,
-) -> deltalake::arrow::array::ArrayRef {
-    let chunked_array = from_polars
-        .column(column_name)
-        .expect(&format!("{:?} not found in {:?}", column_name, from_polars))
-        .chunks();
-    let mut data = vec![];
-    for chunk in chunked_array {
-        let array = chunk
-            .as_any()
-            .downcast_ref::<r_polars::polars::export::arrow::array::Float64Array>();
-        for a in array.unwrap() {
-            data.push(a.unwrap().clone());
-        }
-    }
+convert_arrow_primitive!(
+    convert_between_arrow_formats_int,
+    r_polars::polars::export::arrow::array::Int32Array,
+    deltalake::arrow::array::Int32Array::from
+);
+convert_arrow_primitive!(
+    convert_between_arrow_formats_float,
+    r_polars::polars::export::arrow::array::Float64Array,
+    deltalake::arrow::array::Float64Array::from
+);
 
-    Arc::new(deltalake::arrow::array::Float64Array::from(data))
+macro_rules! convert_between_arrow_formats_list {
+    ($name:ident, $rust_type:ty, $arrow_type:ty, $arrow_type_array:ty) => {
+        fn $name(from_polars: &DataFrame, column_name: &str) -> deltalake::arrow::array::ArrayRef {
+            let chunked_array = from_polars
+                .column(column_name)
+                .expect(&format!("{:?} not found in {:?}", column_name, from_polars))
+                .chunks();
+            let mut data: Vec<Option<$rust_type>> = vec![];
+            for chunk in chunked_array {
+                println!("chunk: {:?}", chunk);
+                let array = chunk.as_any().downcast_ref::<$arrow_type>();
+                println!("array: {:?}", array);
+                for a in array.unwrap() {
+                    // XXX: sadly I need to unwrap a and then make it optional again because
+                    // a = `Option<&f64>`.
+                    data.push(Some(a.unwrap().clone()));
+                }
+            }
+
+            let list_array: GenericListArray<i32> =
+                deltalake::arrow::array::ListArray::from_iter_primitive::<$arrow_type_array, _, _>(
+                    [Some(data)],
+                );
+            Arc::new(list_array)
+        }
+    };
 }
 
-fn convert_between_arrow_formats_list_float(
-    from_polars: &DataFrame,
-    column_name: &str,
-) -> deltalake::arrow::array::ArrayRef {
-    let chunked_array = from_polars
-        .column(column_name)
-        .expect(&format!("{:?} not found in {:?}", column_name, from_polars))
-        .chunks();
-    let mut data: Vec<Option<f64>> = vec![];
-    for chunk in chunked_array {
-        println!("chunk: {:?}", chunk);
-        let array = chunk
-            .as_any()
-            .downcast_ref::<r_polars::polars::export::arrow::array::Float64Array>();
-        println!("array: {:?}", array);
-        for a in array.unwrap() {
-            // XXX: sadly I need to unwrap a and then make it optional again because
-            // a = `Option<&f64>`.
-            data.push(Some(a.unwrap().clone()));
-        }
-    }
-
-    let list_array: GenericListArray<i32> = deltalake::arrow::array::ListArray::from_iter_primitive::<
-        arrow_array::types::Float64Type,
-        _,
-        _,
-    >([Some(data)]);
-    Arc::new(list_array)
-}
-
-fn convert_between_arrow_formats_list_int(
-    from_polars: &DataFrame,
-    column_name: &str,
-) -> deltalake::arrow::array::ArrayRef {
-    let chunked_array = from_polars
-        .column(column_name)
-        .expect(&format!("{:?} not found in {:?}", column_name, from_polars))
-        .chunks();
-    let mut data: Vec<Option<i32>> = vec![];
-    for chunk in chunked_array {
-        let array = chunk
-            .as_any()
-            .downcast_ref::<r_polars::polars::export::arrow::array::Int32Array>();
-        for a in array.unwrap() {
-            // XXX: sadly I need to unwrap a and then make it optional again because
-            // a = `Option<&f64>`.
-            data.push(Some(a.unwrap().clone()));
-        }
-    }
-    let list_array: GenericListArray<i32> = deltalake::arrow::array::ListArray::from_iter_primitive::<
-        arrow_array::types::Int32Type,
-        _,
-        _,
-    >([Some(data)]);
-    Arc::new(list_array)
-}
+convert_between_arrow_formats_list!(
+    convert_between_arrow_formats_list_float,
+    f64,
+    r_polars::polars::export::arrow::array::Float64Array,
+    arrow_array::types::Float64Type
+);
+convert_between_arrow_formats_list!(
+    convert_between_arrow_formats_list_int,
+    i32,
+    r_polars::polars::export::arrow::array::Int32Array,
+    arrow_array::types::Int32Type
+);
 
 async fn create_or_open_delta_table(
     table_dir: &Path,
     table_name: &str,
     comment: &str,
     schema_vec: Vec<Field>,
-) -> Result<DeltaTable, Box<dyn std::error::Error>> {
-    let ops = DeltaOps::try_from_uri(table_dir.to_str().expect("Not a valid OS Path"))
-        .await
-        .unwrap();
+) -> Result<DeltaTable, anyhow::Error> {
+    let ops = DeltaOps::try_from_uri(table_dir.to_str().expect("Not a valid OS Path")).await?;
 
     // The operations module uses a builder pattern that allows specifying several options
     // on how the command behaves. The builders implement `Into<Future>`, so once
@@ -492,9 +494,8 @@ async fn create_or_open_delta_table(
     {
         Ok(table) => table,
         Err(_) => {
-            let ops = DeltaOps::try_from_uri(table_dir.to_str().expect("Not a valid OS Path"))
-                .await
-                .unwrap();
+            let ops =
+                DeltaOps::try_from_uri(table_dir.to_str().expect("Not a valid OS Path")).await?;
             let (table, _) = ops.load().await?;
             table
         }
@@ -585,4 +586,41 @@ fn kvs_get(key: ClientKey, anna: &mut ClientNode) -> anyhow::Result<LatticeValue
     smol::block_on(anna.get(key))
         .map_err(eyre_to_anyhow)
         .context("get failed")
+}
+
+/// Store the given value in the key-value store.
+fn kvs_put(key: ClientKey, value: LatticeValue, anna: &mut ClientNode) -> anyhow::Result<()> {
+    let start = Instant::now();
+
+    smol::block_on(anna.put(key, value))
+        .map_err(eyre_to_anyhow)
+        .context("put failed")?;
+
+    let put_latency = (Instant::now() - start).as_millis();
+    if put_latency >= 100 {
+        log::trace!("high kvs_put latency: {}ms", put_latency);
+    }
+
+    Ok(())
+}
+
+/// Set up the `log` crate.
+fn set_up_logger() -> Result<(), fern::InitError> {
+    fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "{}[{}][{}] {}",
+                chrono::Local::now().format("[%Y-%m-%d][%H:%M:%S]"),
+                record.target(),
+                record.level(),
+                message
+            ))
+        })
+        .level(log::LevelFilter::Info)
+        .level_for("zenoh", log::LevelFilter::Warn)
+        .level_for("essa_function_executor", log::LevelFilter::Trace)
+        .chain(std::io::stdout())
+        .chain(fern::log_file("function-executor.log")?)
+        .apply()?;
+    Ok(())
 }

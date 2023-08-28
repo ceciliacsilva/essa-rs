@@ -1,18 +1,22 @@
 #![warn(missing_docs)]
 use anna::{
     anna_default_zenoh_prefix,
+    lattice::LastWriterWinsLattice,
     lattice::Lattice,
     nodes::{request_cluster_info, ClientNode},
     store::LatticeValue,
     topics::RoutingThread,
     ClientKey,
 };
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use essa_common::{essa_default_zenoh_prefix, executor_run_r_subscribe_topic};
 use extendr_api::prelude::*;
 use extendr_api::Robj;
 use r_polars::conversion_r_to_s::par_read_robjs;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use uuid::Uuid;
 use zenoh::prelude::r#async::*;
 
@@ -112,11 +116,10 @@ async fn r_executor(
                         .context("func is not a LWW lattice")?
                         .into_revealed()
                         .into_value();
-                    // TODO: avoid clone by giving up ownership
                     let args_from_anna_vec: Vec<Vec<u8>> = args_vec
-                        .iter()
+                        .into_iter()
                         .map(|arg| {
-                            arg.clone().into_lww()
+                            arg.into_lww()
                                 .map_err(eyre_to_anyhow)
                                 .context("args is not a LWW lattice")
                                 .unwrap()
@@ -131,8 +134,8 @@ async fn r_executor(
                         .collect();
 
                     let r_dataframes: Vec<r_polars::rdataframe::DataFrame> = dataframes
-                        .iter()
-                        .map(|dataframe| (*dataframe).clone().into())
+                        .into_iter()
+                        .map(|dataframe| (dataframe).into())
                         .collect();
                     println!("dataframes: {:?}", r_dataframes);
 
@@ -143,8 +146,15 @@ async fn r_executor(
                     //log::info!("r list: {:?}", r_lists);
 
                     let function = String::from_utf8(func)?;
-                    let func: Robj = eval_string(&function).unwrap();
-                    let arguments = func.as_function().expect("not a function").formals();
+                    // TODO: this error handling and semantics should be better.
+                    let func: Robj = eval_string(&function).map_err(|e| {
+                        log::error!("Failed with: {:?}", e);
+                        anyhow!("Failed to `eval` function")
+                    })?;
+                    let arguments = func
+                        .as_function()
+                        .expect("The given function is not an `R function`")
+                        .formals();
 
                     let mut arguments_pairlist: Vec<(&str, Robj)> = vec![];
                     match arguments {
@@ -158,26 +168,39 @@ async fn r_executor(
                         }
                     }
 
-                    let result: Robj = func.call(Pairlist::from_pairs(arguments_pairlist)).unwrap();
+                    let result: Robj = func
+                        .call(Pairlist::from_pairs(arguments_pairlist))
+                        .map_err(|e| {
+                            log::error!("Failed with: {:?}", e);
+                            anyhow!("Failed to call R function")
+                        })?;
 
                     // this not enough if the response is a dataframe, because it will be the
                     // most generic type possible.
                     println!("result rtype: {:?}", result.rtype());
-                    final_result =
-                        match result.rtype() {
-                            Rtype::Doubles => convert_from_robj_real_to_polars(result)?,
-                            Rtype::Integers => convert_from_robj_integer_to_polars(result)?,
-                            // TODO: error handling
-                            _ => {
-                                println!("Return type not suported");
-                                convert_from_robj_integer_to_polars(r!(vec![1, 2]))?
-                            },
-                        };
+                    final_result = match result.rtype() {
+                        Rtype::Doubles => convert_from_robj_real_to_polars(result)?,
+                        Rtype::Integers => convert_from_robj_integer_to_polars(result)?,
+                        // TODO: error handling
+                        _ => {
+                            println!("Return type not suported");
+                            convert_from_robj_integer_to_polars(r!(vec![1, 2]))?
+                        }
+                    };
                 }
 
-                let serialize = bincode::serialize(&final_result)?;
+                let serialized = bincode::serialize(&final_result)?;
+                let key: ClientKey = Uuid::new_v4().to_string().into();
+                kvs_put(
+                    key.clone(),
+                    LastWriterWinsLattice::new_now(serialized.into()).into(),
+                    &mut anna_client,
+                )?;
+
+                let key_serialized = bincode::serialize(&key)?;
+
                 query
-                    .reply(Ok(Sample::new(query.key_expr().clone(), serialize)))
+                    .reply(Ok(Sample::new(query.key_expr().clone(), key_serialized)))
                     .res()
                     .await
                     .expect("failed to send sample back");
@@ -192,55 +215,41 @@ async fn r_executor(
     Ok(())
 }
 
-fn convert_from_robj_integer_to_polars(result: Robj) -> anyhow::Result<Vec<r_polars::polars::prelude::Series>> {
-    let mut results = result.as_integer_slice().unwrap().chunks_exact(result.len());
-    if let Some(dim) = result.dim() {
-        match dim.iter().collect::<Vec<_>>().as_slice() {
-            &[_line, col] => {
-                results =
-                    result.as_integer_slice().unwrap().chunks_exact(col.0 as usize)
+macro_rules! create_convert_function {
+    ($name:ident, $as_type_slice:ident) => {
+        fn $name(result: Robj) -> anyhow::Result<Vec<r_polars::polars::prelude::Series>> {
+            let mut results = result
+                .$as_type_slice()
+                .ok_or(anyhow!("Couldn't get a `real slice`"))?
+                .chunks_exact(result.len());
+            if let Some(dim) = result.dim() {
+                match dim.iter().collect::<Vec<_>>().as_slice() {
+                    &[_line, col] => {
+                        results = result
+                            .$as_type_slice()
+                            .ok_or(anyhow!("Couldn't get a `real slice`"))?
+                            .chunks_exact(col.0 as usize)
+                    }
+                    _ => (),
+                }
+            };
+
+            let mut par_objs = vec![];
+
+            for (i, result) in results.enumerate() {
+                par_objs.push((
+                    r_polars::utils::extendr_concurrent::ParRObj(result.into()),
+                    i.to_string(),
+                ));
             }
-            _ => (),
+
+            Ok(par_read_robjs(par_objs)?)
         }
     };
-
-    let mut par_objs = vec![];
-
-    for (i, result) in results.enumerate() {
-        par_objs.push((
-            r_polars::utils::extendr_concurrent::ParRObj(result.into()),
-            i.to_string(),
-        ));
-    }
-
-    Ok(par_read_robjs(par_objs)?)
 }
 
-fn convert_from_robj_real_to_polars(result: Robj) -> anyhow::Result<Vec<r_polars::polars::prelude::Series>> {
-    println!("result dim: {:?}", result.dim());
-    println!("result len: {:?}", result.len());
-    let mut results = result.as_real_slice().unwrap().chunks_exact(result.len());
-    if let Some(dim) = result.dim() {
-        match dim.iter().collect::<Vec<_>>().as_slice() {
-            &[_line, col] => {
-                results =
-                    result.as_real_slice().unwrap().chunks_exact(col.0 as usize)
-            }
-            _ => (),
-        }
-    };
-
-    let mut par_objs = vec![];
-
-    for (i, result) in results.enumerate() {
-        par_objs.push((
-            r_polars::utils::extendr_concurrent::ParRObj(result.into()),
-            i.to_string(),
-        ));
-    }
-
-    Ok(par_read_robjs(par_objs)?)
-}
+create_convert_function!(convert_from_robj_real_to_polars, as_real_slice);
+create_convert_function!(convert_from_robj_integer_to_polars, as_integer_slice);
 
 /// Get the given value in the key-value store.
 ///
@@ -249,6 +258,22 @@ fn kvs_get(key: ClientKey, anna: &mut ClientNode) -> anyhow::Result<LatticeValue
     smol::block_on(anna.get(key))
         .map_err(eyre_to_anyhow)
         .context("get failed")
+}
+
+/// Store the given value in the key-value store.
+fn kvs_put(key: ClientKey, value: LatticeValue, anna: &mut ClientNode) -> anyhow::Result<()> {
+    let start = Instant::now();
+
+    smol::block_on(anna.put(key, value))
+        .map_err(eyre_to_anyhow)
+        .context("put failed")?;
+
+    let put_latency = (Instant::now() - start).as_millis();
+    if put_latency >= 100 {
+        log::trace!("high kvs_put latency: {}ms", put_latency);
+    }
+
+    Ok(())
 }
 
 async fn new_anna_client(zenoh: Arc<zenoh::Session>) -> anyhow::Result<ClientNode> {

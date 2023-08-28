@@ -68,7 +68,9 @@ async fn main() -> anyhow::Result<()> {
         let args = args.clone();
 
         tokio::spawn(async move {
-            if let Err(err) = function_call_receive_loop(args, zenoh, zenoh_prefix).await {
+            if let Err(err) =
+                function_call_receive_loop(args, zenoh, zenoh_prefix).await
+            {
                 log::error!("{:?}", err)
             }
         });
@@ -286,6 +288,8 @@ pub enum EssaResult {
     InvalidFunctionSignature = -5,
     NoResult = -6,
     InvalidResult = -8,
+    FailToCallExternal = -9,
+    FailToSaveKVS = -10,
 }
 
 /// Transforms an [`eyre::Report`] to an [`anyhow::Error`].

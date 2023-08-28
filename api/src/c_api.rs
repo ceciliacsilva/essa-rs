@@ -224,12 +224,9 @@ extern "C" {
         sql_query_len: usize,
         delta_table_ptr: *const u8,
         delta_table_len: usize,
-        result_handler: *mut usize,
+        result_handle: *mut usize,
     ) -> i32;
-}
 
-#[link(wasm_import_module = "host")]
-extern "C" {
     /// `Save` data to `deltalake` using
     /// `delta-rs`.
     pub fn essa_deltalake_save(
@@ -237,6 +234,27 @@ extern "C" {
         table_path_len: usize,
         dataframe_handler_ptr: *const usize,
         dataframe_handler_len: usize,
-        result_handler: *mut usize,
+        result_handle: *mut usize,
+    ) -> i32;
+}
+
+#[link(wasm_import_module = "host")]
+extern "C" {
+    /// Internally calls `Series::new` with the
+    /// given column name and values (a `Vec::<f64>`).
+    pub fn essa_series_new(
+        column_name: *const u8,
+        column_name_len: usize,
+        vec_values: *const f64,
+        vec_values_len: usize,
+        result_handle: *mut usize,
+    ) -> i32;
+
+    /// Internally calls `Dataframe::new` with a vec
+    /// `ResultHandle` for `Series`.
+    pub fn essa_dataframe_new(
+        vec_series: *const usize,
+        vec_series_len: usize,
+        result_handle: *mut usize,
     ) -> i32;
 }

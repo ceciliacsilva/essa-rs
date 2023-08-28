@@ -6,11 +6,13 @@
 use std::{thread, time::Duration};
 
 use crate::c_api::{
-    essa_get_args, essa_get_lattice_data, essa_get_lattice_len, essa_put_lattice, essa_run_r,
-    essa_set_result,
+    essa_dataframe_new, essa_get_args, essa_get_lattice_data, essa_get_lattice_len,
+    essa_put_lattice, essa_run_r, essa_series_new, essa_set_result,
 };
 use anna_api::{ClientKey, LatticeValue};
-use c_api::{essa_call, essa_datafusion_run, essa_get_result, essa_get_result_len, essa_deltalake_save};
+use c_api::{
+    essa_call, essa_datafusion_run, essa_deltalake_save, essa_get_result, essa_get_result_len,
+};
 
 /// Re-export the dependencies on serde and bincode to allow downstream
 /// crates to use the exact same version.
@@ -132,7 +134,10 @@ pub fn datafusion_run(sql_query: &str, table: &str) -> Result<ResultHandle, Essa
 }
 
 /// Involkes save to `deltalake` the given `dataframe`.
-pub fn deltalake_save(table_path: &str, dataframe_handles: &[usize]) -> Result<ResultHandle, EssaResult> {
+pub fn deltalake_save(
+    table_path: &str,
+    dataframe_handles: &[usize],
+) -> Result<ResultHandle, EssaResult> {
     let mut result_handle = 0;
     let result = unsafe {
         essa_deltalake_save(
@@ -150,24 +155,68 @@ pub fn deltalake_save(table_path: &str, dataframe_handles: &[usize]) -> Result<R
     }
 }
 
+/// `essa_series_new`.
+pub fn series_new(col_name: &str, vec_values: &[f64]) -> Result<ResultHandle, EssaResult> {
+    let mut result_handle = 0;
+    let result = unsafe {
+        essa_series_new(
+            col_name.as_ptr(),
+            col_name.len(),
+            vec_values.as_ptr(),
+            std::mem::size_of::<f64>() * vec_values.len(),
+            &mut result_handle,
+        )
+    };
+
+    match result {
+        i if i == EssaResult::Ok as i32 => Ok(ResultHandle(result_handle)),
+        other => return Err(other.try_into().unwrap()),
+    }
+}
+
+/// `essa_dataframe_new`.
+/// Receives a vec of `ResultHandle`.
+pub fn dataframe_new(vec_series_handle: &[usize]) -> Result<ResultHandle, EssaResult> {
+    let mut result_handle = 0;
+    let result = unsafe {
+        essa_dataframe_new(
+            vec_series_handle.as_ptr(),
+            std::mem::size_of::<usize>() * vec_series_handle.len(),
+            &mut result_handle,
+        )
+    };
+
+    match result {
+        i if i == EssaResult::Ok as i32 => Ok(ResultHandle(result_handle)),
+        other => return Err(other.try_into().unwrap()),
+    }
+}
+
 /// Handle to retrieve an asynchronous result of a remote function call.
 ///
 /// To wait on the associated result, use [`wait`](Self::wait).
-#[derive(Debug)]
-pub struct ResultHandle(pub usize);
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ResultHandle(usize);
 
 impl ResultHandle {
+    /// Returns the `Handle` usize.
+    pub fn get_key(&self) -> usize {
+        self.0
+    }
+
     /// Tries to read the lattice value stored for given key from the key-value
     /// store.
     pub fn wait(self) -> Result<Vec<u8>, EssaResult> {
         let mut value_len = 0;
         let result = unsafe { essa_get_result_len(self.0, &mut value_len) };
+        println!("result: {:?}", result);
         let len = match EssaResult::try_from(result) {
             Ok(EssaResult::Ok) => value_len,
             Ok(other) => return Err(other),
             Err(unknown) => panic!("unknown EssaResult variant `{}`", unknown),
         };
 
+        println!("result len: {len}");
         let mut value = vec![0u8; len];
         let result =
             unsafe { essa_get_result(self.0, value.as_mut_ptr(), value.len(), &mut value_len) };
@@ -269,6 +318,10 @@ pub enum EssaResult {
     NoResult = -6,
     /// Failed to deserialize the result of a called WASM function.
     InvalidResult = -8,
+    /// Failed to call external Service.
+    FailToCallExternal = -9,
+    /// Failed to `put` into `anna`.
+    FailToSaveKVS = -10,
 }
 
 impl std::fmt::Display for EssaResult {
@@ -284,6 +337,8 @@ impl std::fmt::Display for EssaResult {
             }
             Self::NoResult => "a WASM function returned without a prior call to `set_result`",
             Self::InvalidResult => "failed to deserialize the result of a called WASM function",
+            Self::FailToCallExternal => "failed to call external service",
+            Self::FailToSaveKVS => "failed to `put` into `anna`",
         };
         f.write_str(s)
     }

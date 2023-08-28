@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use anna_api::{lattice::LastWriterWinsLattice, ClientKey};
 use anyhow::Context;
 use essa_common::{
     essa_default_zenoh_prefix, executor_run_function_topic, executor_run_module_topic,
@@ -158,6 +159,8 @@ async fn call_function(
         match reply.sample {
             Err(e) => eprintln!("`{key}` reply.sample is Err. Error = {e}"),
             Ok(value) => {
+                println!("value: {:?}", value);
+                // TODO this should return a serialized `ClientKey` of value.
                 let sample = Sample::try_from(key, value).expect("Cannot create a `Sample`");
                 query
                     .reply(Ok(sample))

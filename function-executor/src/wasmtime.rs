@@ -5,15 +5,22 @@
 #![warn(missing_docs)]
 
 use crate::{get_args, get_module, kvs_get, kvs_put, EssaResult, FunctionExecutor};
-use anna::{lattice::LastWriterWinsLattice, nodes::ClientNode, ClientKey};
+use anna::{
+    lattice::LastWriterWinsLattice, lattice::Lattice, nodes::ClientNode, store::LatticeValue,
+    ClientKey,
+};
 use anyhow::{bail, Context};
 use essa_common::{scheduler_function_call_topic, scheduler_run_r_function_call_topic};
 use flume::Receiver;
-use std::{collections::HashMap, ops::Deref, sync::Arc};
+use r_polars::polars::prelude::*;
+use std::{collections::HashMap, sync::{Arc, Mutex}};
 use uuid::Uuid;
 use wasmtime::{Caller, Engine, Extern, Linker, Module, Store, ValType};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder};
 use zenoh::{prelude::r#async::*, query::Reply, queryable::Query};
+
+use std::sync::atomic::{AtomicU32, Ordering};
+use lazy_static::lazy_static;
 
 impl FunctionExecutor {
     /// Runs the given WASM module.
@@ -80,18 +87,19 @@ impl FunctionExecutor {
         let module = get_module(module_key.clone(), &mut self.anna)?;
 
         let args = get_args(args_key, &mut self.anna)?;
-        let args_len = u32::try_from(args.len()).unwrap();
+        let args_len = u32::try_from(args.len())?;
 
         // deserialize and set up WASM module
         let engine = Engine::default();
         let module =
             unsafe { Module::deserialize(&engine, module).expect("failed to deserialize module") };
+
         let (mut store, linker) = set_up_module(
             engine,
             &module,
             module_key,
             args,
-            self.zenoh,
+            self.zenoh.clone(),
             self.zenoh_prefix.clone(),
             self.anna,
         )?;
@@ -116,9 +124,24 @@ impl FunctionExecutor {
         // busy-wait on the result key in the KVS anymore.
         let mut host_state = store.into_data();
         if let Some(result_value) = host_state.function_result.take() {
+            log::info!("`handle_function_call` result value is: {result_value:?}");
+
+            // TODO: this is questionable, can I do it without a `new_anna_client`?
+            let mut anna = new_anna_client(self.zenoh).await?;
+            // store args in kvs
+            let key: ClientKey = Uuid::new_v4().to_string().into();
+            kvs_put(
+                key.clone(),
+                LastWriterWinsLattice::new_now(result_value.clone().into()).into(),
+                &mut anna,
+            )?;
+
+            let key_serialized = bincode::serialize(&key)?;
+            log::info!("key serialized: {:?}", key_serialized);
+
             let selector = query.key_expr().clone();
             query
-                .reply(Ok(Sample::new(selector, result_value)))
+                .reply(Ok(Sample::new(selector, key_serialized)))
                 .res()
                 .await
                 .map_err(|e| {
@@ -257,6 +280,46 @@ fn set_up_module(
     linker
         .func_wrap(
             "host",
+            "essa_series_new",
+            |caller: Caller<'_, HostState>,
+             col_name_ptr: u32,
+             col_name_len: u32,
+             vec_values_ptr: u32,
+             vec_values_len: u32,
+             result_handle_ptr: u32| {
+                essa_series_new_wrapper(
+                    caller,
+                    col_name_ptr,
+                    col_name_len,
+                    vec_values_ptr,
+                    vec_values_len,
+                    result_handle_ptr,
+                )
+                .map(|r| r as i32)
+            },
+        )
+        .context("failed to create essa_series_new host function")?;
+    linker
+        .func_wrap(
+            "host",
+            "essa_dataframe_new",
+            |caller: Caller<'_, HostState>,
+             vec_key_series_ptr: u32,
+             vec_key_series_len: u32,
+             result_handle_ptr: u32| {
+                essa_dataframe_new_wrapper(
+                    caller,
+                    vec_key_series_ptr,
+                    vec_key_series_len,
+                    result_handle_ptr,
+                )
+                .map(|r| r as i32)
+            },
+        )
+        .context("failed to create essa_dataframe_new host function")?;
+    linker
+        .func_wrap(
+            "host",
             "essa_datafusion_run",
             |caller: Caller<'_, HostState>,
              sql_query_ptr: u32,
@@ -381,7 +444,7 @@ fn set_up_module(
 }
 
 /// Host function for calling the specified function on a remote node.
-fn essa_call_wrapper(
+fn essa_call_wrapper (
     mut caller: Caller<HostState>,
     function_name_ptr: u32,
     function_name_len: u32,
@@ -412,7 +475,7 @@ fn essa_call_wrapper(
     };
 
     // trigger the external function call
-    match caller.data_mut().essa_call(function_name, args) {
+    match caller.data_mut().essa_call(function_name.clone(), args) {
         Ok(reply) => {
             let host_state = caller.data_mut();
             let handle = host_state.next_result_handle;
@@ -464,11 +527,126 @@ fn essa_run_r_wrapper(
     };
 
     match caller.data_mut().essa_run_r(function, args) {
-        Ok(result) => {
+        Ok(reply) => {
             let host_state = caller.data_mut();
             let handle = host_state.next_result_handle;
             host_state.next_result_handle += 1;
-            host_state.result_receivers.insert(handle, result);
+            host_state.result_receivers.insert(handle, reply);
+
+            // write handle
+            mem.write(
+                &mut caller,
+                result_handle_ptr as usize,
+                &handle.to_le_bytes(),
+            )
+            .context("result_handle_ptr out of bounds")?;
+
+            Ok(EssaResult::Ok)
+        }
+        Err(err) => Ok(err),
+    }
+}
+
+/// Host function for calling the specified R function on a remote node.
+fn essa_series_new_wrapper(
+    mut caller: Caller<HostState>,
+    col_name_ptr: u32,
+    col_name_len: u32,
+    vec_values_ptr: u32,
+    vec_values_len: u32,
+    result_handle_ptr: u32,
+) -> anyhow::Result<EssaResult> {
+    // Use our `caller` context to get the memory export of the
+    // module which called this host function.
+    let mem = match caller.get_export("memory") {
+        Some(Extern::Memory(mem)) => mem,
+        _ => bail!("failed to find host memory"),
+    };
+    // read the function name from the WASM sandbox
+    let col_name = {
+        let mut data = vec![0u8; col_name_len as usize];
+        mem.read(&caller, col_name_ptr as usize, &mut data)
+            .context("function ptr/len out of bounds")?;
+        String::from_utf8(data).context("col name not valid utf8")?
+    };
+    // read the serialized function arguments from the WASM sandbox
+    let vec_values_serialized = {
+        let mut data = vec![0u8; vec_values_len as usize];
+        mem.read(&caller, vec_values_ptr as usize, &mut data)
+            .context("vec values ptr/len out of bounds")?;
+        data
+    };
+
+    let vec_values = split_args_to_f64(&vec_values_serialized);
+
+    match caller.data_mut().essa_series_new(col_name, vec_values) {
+        Ok(key_client) => {
+            let host_state = caller.data_mut();
+            let handle = host_state.next_result_handle;
+            host_state.next_result_handle += 1;
+            host_state.results.insert(handle, key_client);
+
+            // write handle
+            mem.write(
+                &mut caller,
+                result_handle_ptr as usize,
+                &handle.to_le_bytes(),
+            )
+            .context("result_handle_ptr out of bounds")?;
+
+            Ok(EssaResult::Ok)
+        }
+        Err(err) => Ok(err),
+    }
+}
+
+/// Host function for calling the specified R function on a remote node.
+fn essa_dataframe_new_wrapper(
+    mut caller: Caller<HostState>,
+    vec_client_key_series_ptr: u32,
+    vec_client_key_series_len: u32,
+    result_handle_ptr: u32,
+) -> anyhow::Result<EssaResult> {
+    // Use our `caller` context to get the memory export of the
+    // module which called this host function.
+    let mem = match caller.get_export("memory") {
+        Some(Extern::Memory(mem)) => mem,
+        _ => bail!("failed to find host memory"),
+    };
+
+    // read the serialized function arguments from the WASM sandbox
+    let handle_vec_series = {
+        let mut data = vec![0u8; vec_client_key_series_len as usize];
+        mem.read(&caller, vec_client_key_series_ptr as usize, &mut data)
+            .context("vec values ptr/len out of bounds")?;
+        data
+    };
+
+    println!("handle vec series: {:?}", handle_vec_series);
+
+    let vec_key_series_handle = split_args_to_handles(&handle_vec_series);
+
+    println!("key vec series: {:?}", vec_key_series_handle);
+
+    // TODO: this should be better
+    let vec_key_series: Vec<ClientKey> = vec_key_series_handle
+        .iter()
+        .map(|handle: &u32| {
+            // TODO: remove unwrap()
+            smol::block_on(caller.data_mut().get_result(*handle))
+                .map_err(|_| EssaResult::UnknownError)
+                .unwrap()
+        })
+        .collect();
+
+    println!("vec key series: {:?}", vec_key_series);
+
+    match caller.data_mut().essa_dataframe_new(vec_key_series) {
+        Ok(key_client) => {
+            let host_state = caller.data_mut();
+            let handle = host_state.next_result_handle;
+            host_state.next_result_handle += 1;
+            host_state.results.insert(handle, key_client);
 
             // write handle
             mem.write(
@@ -500,14 +678,14 @@ fn essa_datafusion_run_wrapper(
         _ => bail!("failed to find host memory"),
     };
     // read the sql_query name from the WASM sandbox
-    let sql_query = {
+    let sql_query: String = {
         let mut data = vec![0u8; sql_query_len as usize];
         mem.read(&caller, sql_query_ptr as usize, &mut data)
             .context("sql_query ptr/len out of bounds")?;
         String::from_utf8(data).context("sql_query name not valid utf8")?
     };
     // read the serialized sql_query arguments from the WASM sandbox
-    let delta_table = {
+    let delta_table: String = {
         let mut data = vec![0u8; delta_table_len as usize];
         mem.read(&caller, delta_table_ptr as usize, &mut data)
             .context("sql_query args ptr/len out of bounds")?;
@@ -518,11 +696,11 @@ fn essa_datafusion_run_wrapper(
         .data_mut()
         .essa_datafusion_run(sql_query, delta_table)
     {
-        Ok(result) => {
+        Ok(reply) => {
             let host_state = caller.data_mut();
             let handle = host_state.next_result_handle;
             host_state.next_result_handle += 1;
-            host_state.result_receivers.insert(handle, result);
+            host_state.result_receivers.insert(handle, reply);
 
             // write handle
             mem.write(
@@ -570,11 +748,11 @@ fn essa_deltalake_save_wrapper(
     };
 
     match caller.data_mut().essa_deltalake_save(table_path, args) {
-        Ok(result) => {
+        Ok(reply) => {
             let host_state = caller.data_mut();
             let handle = host_state.next_result_handle;
             host_state.next_result_handle += 1;
-            host_state.result_receivers.insert(handle, result);
+            host_state.result_receivers.insert(handle, reply);
 
             // write handle
             mem.write(
@@ -601,12 +779,22 @@ fn essa_get_result_len_wrapper(
         Some(Extern::Memory(mem)) => mem,
         _ => bail!("failed to find host memory"),
     };
-    let a = smol::block_on(caller.data_mut().get_result(handle));
 
     // get the corresponding value from the KVS
-    match a {
-        Ok(value) => {
-            let len = value.len();
+    match smol::block_on(caller.data_mut().get_result(handle)) {
+        Ok(key) => {
+            println!("key: {:?}", key);
+            let value_lattice: LatticeValue = kvs_get(key, &mut caller.data_mut().anna)?;
+
+            let value_serialized = value_lattice
+                .into_lww()
+                .map_err(crate::eyre_to_anyhow)
+                .unwrap()
+                .into_revealed()
+                .into_value();
+
+            let len = value_serialized.len();
+            println!("+++++++++len no get len: {len}");
             // write the length of the value into the sandbox
             //
             // We cannot write the value directly because the WASM module
@@ -641,22 +829,35 @@ fn essa_get_result_wrapper(
 
     // get the corresponding value from the KVS
     match smol::block_on(caller.data_mut().get_result(handle)) {
-        Ok(value) => {
-            if value.len() > val_capacity as usize {
+        Ok(key) => {
+            let value_lattice: LatticeValue = kvs_get(key, &mut caller.data_mut().anna)?;
+            log::info!(
+                "`essa_get_result` lattice from handle = {handle} is {:?}",
+                value_lattice
+            );
+
+            let value_serialized = value_lattice
+                .into_lww()
+                .map_err(crate::eyre_to_anyhow)
+                .unwrap()
+                .into_revealed()
+                .into_value();
+
+            if value_serialized.len() > val_capacity as usize {
                 Ok(EssaResult::BufferTooSmall)
             } else {
                 // write the value into the sandbox
-                mem.write(&mut caller, val_ptr as usize, &value)
+                mem.write(&mut caller, val_ptr as usize, &value_serialized)
                     .context("val ptr/len out of bounds")?;
                 // write the length of the value
                 mem.write(
                     &mut caller,
                     val_len_ptr as usize,
-                    &u32::try_from(value.len()).unwrap().to_le_bytes(),
+                    &u32::try_from(value_serialized.len()).unwrap().to_le_bytes(),
                 )
                 .context("val_len_ptr out of bounds")?;
 
-                // TODO: is it ok to stop removing this??
+                // TODO: Should/could I make this work?
                 //caller.data_mut().remove_result(handle);
 
                 Ok(EssaResult::Ok)
@@ -726,6 +927,7 @@ fn essa_get_lattice_len_wrapper(
             .context("key is not valid utf8")?
             .into()
     };
+
     // get the corresponding value from the KVS
     match caller.data_mut().get_lattice(&key) {
         Ok(value) => {
@@ -800,7 +1002,7 @@ fn essa_get_lattice_data_wrapper(
 /// The `wasmtime` crate gives this struct as an additional argument to all
 /// host functions, which makes it possible to keep state between across
 /// host function invocations.
-struct HostState {
+pub struct HostState {
     wasi: WasiCtx,
     /// The compiled WASM module.
     module: Module,
@@ -813,7 +1015,7 @@ struct HostState {
 
     next_result_handle: u32,
     result_receivers: HashMap<u32, flume::Receiver<Reply>>,
-    results: HashMap<u32, Arc<Vec<u8>>>,
+    results: HashMap<u32, ClientKey>,
 
     zenoh: Arc<zenoh::Session>,
     zenoh_prefix: String,
@@ -847,7 +1049,7 @@ impl HostState {
             LastWriterWinsLattice::new_now(args).into(),
             &mut self.anna,
         )
-        .map_err(|_| EssaResult::UnknownError)?;
+        .map_err(|_| EssaResult::FailToSaveKVS)?;
 
         // trigger the function call on a remote node
         let reply = smol::block_on(call_function_extern(
@@ -857,7 +1059,7 @@ impl HostState {
             self.zenoh.clone(),
             &self.zenoh_prefix,
         ))
-        .unwrap();
+        .map_err(|_| EssaResult::FailToCallExternal)?;
 
         Ok(reply)
     }
@@ -875,35 +1077,19 @@ impl HostState {
             LastWriterWinsLattice::new_now(func.as_bytes().into()).into(),
             &mut self.anna,
         )
-        .map_err(|_| EssaResult::UnknownError)?;
+        .map_err(|_| EssaResult::FailToSaveKVS)?;
 
         let args_handles: Vec<u32> = split_args_to_handles(&args);
 
         // TODO: this should be better
-        let args_values: Vec<Arc<Vec<u8>>> = args_handles
+        let args_key_vec: Vec<ClientKey> = args_handles
             .iter()
             .map(|handle: &u32| {
-                // TODO: remove unwrap()
-                smol::block_on(self.get_result(*handle))
-                    .map_err(|_| EssaResult::UnknownError)
-                    .unwrap()
+                let result = smol::block_on(self.get_result(*handle));
+                println!("**********{handle} result = {result:?}");
+                result.map_err(|_| EssaResult::UnknownError).unwrap()
             })
             .collect();
-
-        let mut args_key_vec = vec![];
-
-        for args in args_values {
-            // get `args` from `Arc`.
-            let args = unsafe { &*Arc::into_raw(args.clone()) }.clone();
-            let args_key: ClientKey = Uuid::new_v4().to_string().into();
-            kvs_put(
-                args_key.clone(),
-                LastWriterWinsLattice::new_now(args.into()).into(),
-                &mut self.anna,
-            )
-            .map_err(|_| EssaResult::UnknownError)?;
-            args_key_vec.push(args_key);
-        }
 
         let args_vec_key: ClientKey = Uuid::new_v4().to_string().into();
         let serialized_args_key_vec =
@@ -913,7 +1099,7 @@ impl HostState {
             LastWriterWinsLattice::new_now(serialized_args_key_vec).into(),
             &mut self.anna,
         )
-        .map_err(|_| EssaResult::UnknownError)?;
+        .map_err(|_| EssaResult::FailToSaveKVS)?;
 
         // trigger the function call on a remote node
         let reply = smol::block_on(run_r_extern(
@@ -922,9 +1108,72 @@ impl HostState {
             self.zenoh.clone(),
             &self.zenoh_prefix,
         ))
-        .unwrap();
+        .map_err(|_| EssaResult::FailToCallExternal)?;
 
         Ok(reply)
+    }
+
+    /// Creates a `Series::new`
+    fn essa_series_new(
+        &mut self,
+        col_name: String,
+        vec_values: Vec<f64>,
+    ) -> Result<ClientKey, EssaResult> {
+        let vec_series = Series::new(&col_name, vec_values);
+        let serialized_vec_series =
+            bincode::serialize(&vec_series).map_err(|_| EssaResult::UnknownError)?;
+
+        let key_vec_series: ClientKey = Uuid::new_v4().to_string().into();
+        // TODO: add series as a supported values inside anna.
+        let lattice: anna::store::LatticeValue =
+            LastWriterWinsLattice::new_now(serialized_vec_series).into();
+        kvs_put(key_vec_series.clone(), lattice, &mut self.anna)
+            .map_err(|_| EssaResult::FailToSaveKVS)?;
+
+        Ok(key_vec_series)
+    }
+
+    /// Creates a `Dataframe::new`
+    fn essa_dataframe_new(
+        &mut self,
+        vec_key_series: Vec<ClientKey>,
+    ) -> Result<ClientKey, EssaResult> {
+        // TODO: shouldn't `unwrap` this
+        let vec_series_serialized: Vec<LatticeValue> = vec_key_series
+            .into_iter()
+            .map(|key| kvs_get(key, &mut self.anna).unwrap())
+            .collect();
+        println!("vec series serialized: {:?}", vec_series_serialized);
+
+        // TODO: better error handling is needed here.
+        let vec_series: Vec<Series> = vec_series_serialized
+            .into_iter()
+            .map(|serie_lattice| {
+                let value = serie_lattice
+                    .into_lww()
+                    .map_err(crate::eyre_to_anyhow)
+                    .unwrap()
+                    .into_revealed()
+                    .into_value();
+
+                bincode::deserialize::<Series>(&value).unwrap()
+            })
+            .collect();
+        println!("vec series: {:?}", vec_series);
+
+        let dataframe = DataFrame::new(vec_series).map_err(|_| EssaResult::UnknownError)?;
+        let serialized_dataframe =
+            bincode::serialize(&dataframe).map_err(|_| EssaResult::UnknownError)?;
+
+        let key_dataframe: ClientKey = Uuid::new_v4().to_string().into();
+        println!("key dataframe: {:?}", key_dataframe);
+        // TODO: add series as a supported values inside anna.
+        let lattice: anna::store::LatticeValue =
+            LastWriterWinsLattice::new_now(serialized_dataframe).into();
+        kvs_put(key_dataframe.clone(), lattice, &mut self.anna)
+            .map_err(|_| EssaResult::FailToSaveKVS)?;
+
+        Ok(key_dataframe)
     }
 
     /// Calls the given function on a node and returns the reply receiver for
@@ -940,7 +1189,7 @@ impl HostState {
             LastWriterWinsLattice::new_now(sql_query.as_bytes().into()).into(),
             &mut self.anna,
         )
-        .map_err(|_| EssaResult::UnknownError)?;
+        .map_err(|_| EssaResult::FailToSaveKVS)?;
 
         // store args in kvs
         let delta_table_key: ClientKey = Uuid::new_v4().to_string().into();
@@ -949,7 +1198,7 @@ impl HostState {
             LastWriterWinsLattice::new_now(delta_table.as_bytes().into()).into(),
             &mut self.anna,
         )
-        .map_err(|_| EssaResult::UnknownError)?;
+        .map_err(|_| EssaResult::FailToSaveKVS)?;
 
         // trigger the function call on a remote node
         let reply = smol::block_on(datafusion_run_extern(
@@ -958,7 +1207,7 @@ impl HostState {
             self.zenoh.clone(),
             &self.zenoh_prefix,
         ))
-        .unwrap();
+        .map_err(|_| EssaResult::FailToCallExternal)?;
 
         Ok(reply)
     }
@@ -968,7 +1217,7 @@ impl HostState {
     fn essa_deltalake_save(
         &mut self,
         table_path: String,
-        args: Vec<u8>,
+        vec_handle: Vec<u8>,
     ) -> Result<flume::Receiver<Reply>, EssaResult> {
         let table_path_key: ClientKey = Uuid::new_v4().to_string().into();
         kvs_put(
@@ -976,35 +1225,26 @@ impl HostState {
             LastWriterWinsLattice::new_now(table_path.as_bytes().into()).into(),
             &mut self.anna,
         )
-        .map_err(|_| EssaResult::UnknownError)?;
+        .map_err(|_| EssaResult::FailToSaveKVS)?;
 
-        let args_handles: Vec<u32> = split_args_to_handles(&args);
+        let args_handles: Vec<u32> = split_args_to_handles(&vec_handle);
+
+        println!("args handles: {:?}", args_handles);
 
         // TODO: this should be better
-        let args_values: Vec<Arc<Vec<u8>>> = args_handles
+        let args_key_vec: Vec<ClientKey> = args_handles
             .iter()
             .map(|handle: &u32| {
                 // TODO: remove unwrap()
+                println!(
+                    "meu get result do deltalake sabe: {:?}",
+                    smol::block_on(self.get_result(*handle))
+                );
                 smol::block_on(self.get_result(*handle))
                     .map_err(|_| EssaResult::UnknownError)
                     .unwrap()
             })
             .collect();
-
-        let mut args_key_vec = vec![];
-
-        for args in args_values {
-            // get `args` from `Arc`.
-            let args = unsafe { &*Arc::into_raw(args.clone()) }.clone();
-            let args_key: ClientKey = Uuid::new_v4().to_string().into();
-            kvs_put(
-                args_key.clone(),
-                LastWriterWinsLattice::new_now(args.into()).into(),
-                &mut self.anna,
-            )
-            .map_err(|_| EssaResult::UnknownError)?;
-            args_key_vec.push(args_key);
-        }
 
         let args_vec_key: ClientKey = Uuid::new_v4().to_string().into();
         let serialized_args_key_vec =
@@ -1014,7 +1254,7 @@ impl HostState {
             LastWriterWinsLattice::new_now(serialized_args_key_vec).into(),
             &mut self.anna,
         )
-        .map_err(|_| EssaResult::UnknownError)?;
+        .map_err(|_| EssaResult::FailToSaveKVS)?;
 
         // trigger the function call on a remote node
         let reply = smol::block_on(deltalake_save_extern(
@@ -1023,7 +1263,7 @@ impl HostState {
             self.zenoh.clone(),
             &self.zenoh_prefix,
         ))
-        .unwrap();
+        .map_err(|_| EssaResult::FailToCallExternal)?;
 
         Ok(reply)
     }
@@ -1031,7 +1271,7 @@ impl HostState {
     /// Stores the given serialized `LattiveValue` in the KVS.
     fn put_lattice(&mut self, key: &ClientKey, value: &[u8]) -> Result<(), EssaResult> {
         let value = bincode::deserialize(value).map_err(|_| EssaResult::UnknownError)?;
-        kvs_put(self.with_prefix(key), value, &mut self.anna).map_err(|_| EssaResult::UnknownError)
+        kvs_put(self.with_prefix(key), value, &mut self.anna).map_err(|_| EssaResult::FailToSaveKVS)
     }
 
     /// Reads the `LattiveValue` at the specified key from the KVS serializes it.
@@ -1045,16 +1285,21 @@ impl HostState {
         format!("{}/data/{}", self.module_key, key).into()
     }
 
-    async fn get_result(&mut self, handle: u32) -> Result<Arc<Vec<u8>>, EssaResult> {
+    async fn get_result(&mut self, handle: u32) -> Result<ClientKey, EssaResult> {
+        println!(
+            "dentro do get_result onlhando hashmap: {:?}\n\n",
+            self.results.entry(handle)
+        );
         match self.results.entry(handle) {
             std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.get().clone()),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                if let Some(result) = self.result_receivers.remove(&handle) {
+                if let Some(result) = self.result_receivers.get(&handle) {
                     let reply = result.recv_async().await.map_err(|e| {
                         log::debug!("Error get_result, recv_async: {e:?}");
                         EssaResult::UnknownError
                     })?;
 
+                    log::info!("reply: {:?}", reply.sample);
                     let value = reply
                         .sample
                         .map_err(|_e| EssaResult::UnknownError)?
@@ -1063,18 +1308,27 @@ impl HostState {
                         .contiguous()
                         .into_owned();
 
-                    let value = entry.insert(Arc::new(value));
-                    Ok(value.clone())
+                    let a = bincode::deserialize::<usize>(&value);
+                    log::info!("Value from `get_result` {handle}: {value:?}, a = {a:?}");
+
+                    let key_value: ClientKey =
+                        bincode::deserialize(&value).map_err(|_| EssaResult::FailToCallExternal)?;
+                    log::info!("ClientKey from `get_result` {handle}: {key_value:?}");
+
+                    let _value = entry.insert(key_value.clone());
+
+                    Ok(key_value)
                 } else {
+                    log::error!("result_receivers for {handle} is None");
                     Err(EssaResult::NotFound)
                 }
             }
         }
     }
 
-    fn remove_result(&mut self, handle: u32) {
-        self.results.remove(&handle);
-    }
+    // fn _remove_result(&mut self, handle: u32) {
+    //     self.results.remove(&handle);
+    // }
 }
 
 /// Call the specfied function on a remote node.
@@ -1124,8 +1378,9 @@ async fn datafusion_run_extern(
     sql_query_key: ClientKey,
     delta_table_key: ClientKey,
     zenoh: Arc<zenoh::Session>,
-    zenoh_prefix: &str,
+    _zenoh_prefix: &str,
 ) -> anyhow::Result<Receiver<Reply>> {
+    println!("Datafusion query_expr: essa/datafusion/{sql_query_key}/{delta_table_key}");
     let topic = format!("essa/datafusion/{sql_query_key}/{delta_table_key}");
 
     let reply = zenoh
@@ -1143,7 +1398,7 @@ async fn deltalake_save_extern(
     table_path_key: ClientKey,
     dataframe_key: ClientKey,
     zenoh: Arc<zenoh::Session>,
-    zenoh_prefix: &str,
+    _zenoh_prefix: &str,
 ) -> anyhow::Result<Receiver<Reply>> {
     let topic = format!("essa/save-deltalake/{table_path_key}/{dataframe_key}");
 
@@ -1158,6 +1413,7 @@ async fn deltalake_save_extern(
     Ok(reply)
 }
 
+// TODO: make those `split_args_to_*` a macro.
 fn split_args_to_handles(args: &[u8]) -> Vec<u32> {
     let mut ptr_args = args;
     let mut handles = vec![];
@@ -1172,4 +1428,67 @@ fn split_args_to_handles(args: &[u8]) -> Vec<u32> {
             return handles;
         }
     }
+}
+
+fn split_args_to_f64(args: &[u8]) -> Vec<f64> {
+    let mut ptr_args = args;
+    let mut handles = vec![];
+
+    loop {
+        let (int_bytes, rest) = ptr_args.split_at(std::mem::size_of::<f64>());
+
+        handles.push(f64::from_ne_bytes(int_bytes.try_into().unwrap()));
+        ptr_args = rest;
+
+        if rest.is_empty() {
+            return handles;
+        }
+    }
+}
+
+// TODO: Remove this duplication.
+/// Crate a new anna connection.
+async fn new_anna_client(zenoh: Arc<zenoh::Session>) -> anyhow::Result<ClientNode> {
+    let zenoh_prefix = anna::anna_default_zenoh_prefix().to_owned();
+
+    let cluster_info = anna::nodes::request_cluster_info(&zenoh, &zenoh_prefix)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))
+        .context("Failed to request cluster info from seed node")?;
+
+    let routing_threads: Vec<_> = cluster_info
+        .routing_node_ids
+        .into_iter()
+        .map(|node_id| anna::topics::RoutingThread {
+            node_id,
+            // TODO: use anna config file to get number of threads per
+            // routing node
+            thread_id: 0,
+        })
+        .collect();
+
+    // connect to anna as a new client node
+    let mut anna = ClientNode::new(
+        Uuid::new_v4().to_string(),
+        0,
+        routing_threads,
+        std::time::Duration::from_secs(10),
+        zenoh,
+        zenoh_prefix,
+    )
+    .map_err(eyre_to_anyhow)
+    .context("failed to connect to anna")?;
+
+    anna.init_tcp_connections()
+        .await
+        .map_err(eyre_to_anyhow)
+        .context("Failed to init TCP connections in anna client")?;
+
+    Ok(anna)
+}
+
+/// Transforms an [`eyre::Report`] to an [`anyhow::Error`].
+fn eyre_to_anyhow(err: eyre::Report) -> anyhow::Error {
+    let err = Box::<dyn std::error::Error + 'static + Send + Sync>::from(err);
+    anyhow::anyhow!(err)
 }

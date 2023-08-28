@@ -5,6 +5,7 @@ use std::marker::PhantomData;
 ///
 /// Used by the `essa-macros` crate.
 #[must_use]
+#[derive(Debug)]
 pub struct RemoteFunctionResult<T> {
     result_handle: ResultHandle,
     data: PhantomData<T>,
@@ -28,6 +29,7 @@ where
     /// Waits until the result becomes available.
     pub fn get(self) -> Result<T, EssaResult> {
         let value = self.result_handle.wait()?;
+        println!("`remote result get` value = {:?}", value);
         let deserialized = bincode::deserialize(&value).map_err(|_| EssaResult::InvalidResult)?;
         Ok(deserialized)
     }
