@@ -13,14 +13,11 @@ use anyhow::{bail, Context};
 use essa_common::{scheduler_function_call_topic, scheduler_run_r_function_call_topic};
 use flume::Receiver;
 use r_polars::polars::prelude::*;
-use std::{collections::HashMap, sync::{Arc, Mutex}};
+use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
 use wasmtime::{Caller, Engine, Extern, Linker, Module, Store, ValType};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder};
 use zenoh::{prelude::r#async::*, query::Reply, queryable::Query};
-
-use std::sync::atomic::{AtomicU32, Ordering};
-use lazy_static::lazy_static;
 
 impl FunctionExecutor {
     /// Runs the given WASM module.
@@ -373,6 +370,15 @@ fn set_up_module(
     linker
         .func_wrap(
             "host",
+            "essa_get_result_key_len",
+            |caller: Caller<'_, HostState>, handle: u32, key_len_ptr: u32| {
+                essa_get_result_key_len_wrapper(caller, handle, key_len_ptr).map(|r| r as i32)
+            },
+        )
+        .context("failed to create essa_get_result_len host function")?;
+    linker
+        .func_wrap(
+            "host",
             "essa_get_result",
             |caller: Caller<'_, HostState>,
              handle: u32,
@@ -380,6 +386,20 @@ fn set_up_module(
              value_capacity: u32,
              value_len_ptr: u32| {
                 essa_get_result_wrapper(caller, handle, value_ptr, value_capacity, value_len_ptr)
+                    .map(|r| r as i32)
+            },
+        )
+        .context("failed to create essa_get_result host function")?;
+    linker
+        .func_wrap(
+            "host",
+            "essa_get_result_key",
+            |caller: Caller<'_, HostState>,
+             handle: u32,
+             key_ptr: u32,
+             key_capacity: u32,
+             key_len_ptr: u32| {
+                essa_get_result_key_wrapper(caller, handle, key_ptr, key_capacity, key_len_ptr)
                     .map(|r| r as i32)
             },
         )
@@ -444,7 +464,7 @@ fn set_up_module(
 }
 
 /// Host function for calling the specified function on a remote node.
-fn essa_call_wrapper (
+fn essa_call_wrapper(
     mut caller: Caller<HostState>,
     function_name_ptr: u32,
     function_name_len: u32,
@@ -622,24 +642,9 @@ fn essa_dataframe_new_wrapper(
         data
     };
 
-    println!("handle vec series: {:?}", handle_vec_series);
+    let vec_key_series = split_args_to_clientkey(&handle_vec_series);
 
-    let vec_key_series_handle = split_args_to_handles(&handle_vec_series);
-
-    println!("key vec series: {:?}", vec_key_series_handle);
-
-    // TODO: this should be better
-    let vec_key_series: Vec<ClientKey> = vec_key_series_handle
-        .iter()
-        .map(|handle: &u32| {
-            // TODO: remove unwrap()
-            smol::block_on(caller.data_mut().get_result(*handle))
-                .map_err(|_| EssaResult::UnknownError)
-                .unwrap()
-        })
-        .collect();
-
-    println!("vec key series: {:?}", vec_key_series);
+    println!("key vec series: {:?}", vec_key_series);
 
     match caller.data_mut().essa_dataframe_new(vec_key_series) {
         Ok(key_client) => {
@@ -783,8 +788,7 @@ fn essa_get_result_len_wrapper(
     // get the corresponding value from the KVS
     match smol::block_on(caller.data_mut().get_result(handle)) {
         Ok(key) => {
-            println!("key: {:?}", key);
-            let value_lattice: LatticeValue = kvs_get(key, &mut caller.data_mut().anna)?;
+            let value_lattice: LatticeValue = kvs_get(key.clone(), &mut caller.data_mut().anna)?;
 
             let value_serialized = value_lattice
                 .into_lww()
@@ -793,8 +797,14 @@ fn essa_get_result_len_wrapper(
                 .into_revealed()
                 .into_value();
 
+            log::info!(
+                "`essa get result len` key: {:?} and value: {:?}",
+                key,
+                value_serialized
+            );
+
             let len = value_serialized.len();
-            println!("+++++++++len no get len: {len}");
+
             // write the length of the value into the sandbox
             //
             // We cannot write the value directly because the WASM module
@@ -808,6 +818,85 @@ fn essa_get_result_len_wrapper(
             .context("val_len_ptr out of bounds")?;
 
             Ok(EssaResult::Ok)
+        }
+        Err(err) => Ok(err),
+    }
+}
+
+fn essa_get_result_key_len_wrapper(
+    mut caller: Caller<HostState>,
+    handle: u32,
+    key_len_ptr: u32,
+) -> anyhow::Result<EssaResult> {
+    // Use our `caller` context to learn about the memory export of the
+    // module which called this host function.
+    let mem = match caller.get_export("memory") {
+        Some(Extern::Memory(mem)) => mem,
+        _ => bail!("failed to find host memory"),
+    };
+
+    // get the corresponding value from the KVS
+    match smol::block_on(caller.data_mut().get_result(handle)) {
+        Ok(key) => {
+            let key_serialized = bincode::serialize(&key)?;
+            let len = key_serialized.len();
+            // write the length of the value into the sandbox
+            //
+            // We cannot write the value directly because the WASM module
+            // needs to allocate some space for the (dynamically-sized) value
+            // first.
+            mem.write(
+                &mut caller,
+                key_len_ptr as usize,
+                &u32::try_from(len).unwrap().to_le_bytes(),
+            )
+            .context("val_len_ptr out of bounds")?;
+
+            Ok(EssaResult::Ok)
+        }
+        Err(err) => Ok(err),
+    }
+}
+
+fn essa_get_result_key_wrapper(
+    mut caller: Caller<HostState>,
+    handle: u32,
+    key_ptr: u32,
+    key_capacity: u32,
+    key_len_ptr: u32,
+) -> anyhow::Result<EssaResult> {
+    // Use our `caller` context to learn about the memory export of the
+    // module which called this host function.
+    let mem = match caller.get_export("memory") {
+        Some(Extern::Memory(mem)) => mem,
+        _ => bail!("failed to find host memory"),
+    };
+
+    match smol::block_on(caller.data_mut().get_result(handle)) {
+        Ok(key) => {
+            log::info!("`essa_get_result_key` handle = {handle} is {key:?}");
+
+            let key_serialized = bincode::serialize(&key)?;
+
+            if key_serialized.len() > key_capacity as usize {
+                Ok(EssaResult::BufferTooSmall)
+            } else {
+                // write the value into the sandbox
+                mem.write(&mut caller, key_ptr as usize, &key_serialized)
+                    .context("key ptr/len out of bounds")?;
+                // write the length of the value
+                mem.write(
+                    &mut caller,
+                    key_len_ptr as usize,
+                    &u32::try_from(key_serialized.len()).unwrap().to_le_bytes(),
+                )
+                .context("val_len_ptr out of bounds")?;
+
+                // TODO: Should/could I make this work?
+                //caller.data_mut().remove_result(handle);
+
+                Ok(EssaResult::Ok)
+            }
         }
         Err(err) => Ok(err),
     }
@@ -1079,17 +1168,9 @@ impl HostState {
         )
         .map_err(|_| EssaResult::FailToSaveKVS)?;
 
-        let args_handles: Vec<u32> = split_args_to_handles(&args);
+        let args_key_vec: Vec<ClientKey> = split_args_to_clientkey(&args);
 
-        // TODO: this should be better
-        let args_key_vec: Vec<ClientKey> = args_handles
-            .iter()
-            .map(|handle: &u32| {
-                let result = smol::block_on(self.get_result(*handle));
-                println!("**********{handle} result = {result:?}");
-                result.map_err(|_| EssaResult::UnknownError).unwrap()
-            })
-            .collect();
+        log::info!("=========args_key_vec: {args_key_vec:?}");
 
         let args_vec_key: ClientKey = Uuid::new_v4().to_string().into();
         let serialized_args_key_vec =
@@ -1119,18 +1200,19 @@ impl HostState {
         col_name: String,
         vec_values: Vec<f64>,
     ) -> Result<ClientKey, EssaResult> {
-        let vec_series = Series::new(&col_name, vec_values);
-        let serialized_vec_series =
-            bincode::serialize(&vec_series).map_err(|_| EssaResult::UnknownError)?;
+        let series = Series::new(&col_name, vec_values);
+        let serialized_series =
+            bincode::serialize(&series).map_err(|_| EssaResult::UnknownError)?;
 
-        let key_vec_series: ClientKey = Uuid::new_v4().to_string().into();
+        let key_series: ClientKey = Uuid::new_v4().to_string().into();
+
         // TODO: add series as a supported values inside anna.
         let lattice: anna::store::LatticeValue =
-            LastWriterWinsLattice::new_now(serialized_vec_series).into();
-        kvs_put(key_vec_series.clone(), lattice, &mut self.anna)
+            LastWriterWinsLattice::new_now(serialized_series).into();
+        kvs_put(key_series.clone(), lattice, &mut self.anna)
             .map_err(|_| EssaResult::FailToSaveKVS)?;
 
-        Ok(key_vec_series)
+        Ok(key_series)
     }
 
     /// Creates a `Dataframe::new`
@@ -1227,24 +1309,9 @@ impl HostState {
         )
         .map_err(|_| EssaResult::FailToSaveKVS)?;
 
-        let args_handles: Vec<u32> = split_args_to_handles(&vec_handle);
+        let args_key_vec: Vec<ClientKey> = split_args_to_clientkey(&vec_handle);
 
-        println!("args handles: {:?}", args_handles);
-
-        // TODO: this should be better
-        let args_key_vec: Vec<ClientKey> = args_handles
-            .iter()
-            .map(|handle: &u32| {
-                // TODO: remove unwrap()
-                println!(
-                    "meu get result do deltalake sabe: {:?}",
-                    smol::block_on(self.get_result(*handle))
-                );
-                smol::block_on(self.get_result(*handle))
-                    .map_err(|_| EssaResult::UnknownError)
-                    .unwrap()
-            })
-            .collect();
+        println!("args handles: {:?}", args_key_vec);
 
         let args_vec_key: ClientKey = Uuid::new_v4().to_string().into();
         let serialized_args_key_vec =
@@ -1286,10 +1353,7 @@ impl HostState {
     }
 
     async fn get_result(&mut self, handle: u32) -> Result<ClientKey, EssaResult> {
-        println!(
-            "dentro do get_result onlhando hashmap: {:?}\n\n",
-            self.results.entry(handle)
-        );
+        log::info!("host state `get result`: {:?}", self.results.entry(handle));
         match self.results.entry(handle) {
             std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.get().clone()),
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -1299,7 +1363,6 @@ impl HostState {
                         EssaResult::UnknownError
                     })?;
 
-                    log::info!("reply: {:?}", reply.sample);
                     let value = reply
                         .sample
                         .map_err(|_e| EssaResult::UnknownError)?
@@ -1307,9 +1370,6 @@ impl HostState {
                         .payload
                         .contiguous()
                         .into_owned();
-
-                    let a = bincode::deserialize::<usize>(&value);
-                    log::info!("Value from `get_result` {handle}: {value:?}, a = {a:?}");
 
                     let key_value: ClientKey =
                         bincode::deserialize(&value).map_err(|_| EssaResult::FailToCallExternal)?;
@@ -1413,8 +1473,27 @@ async fn deltalake_save_extern(
     Ok(reply)
 }
 
+fn split_args_to_clientkey(args: &[u8]) -> Vec<ClientKey> {
+    let mut ptr_args = args;
+    let mut handles = vec![];
+
+    loop {
+        let size_clientkey_serialized = 44;
+        let (clientkey_bytes, rest) = ptr_args.split_at(size_clientkey_serialized);
+
+        handles.push(
+            bincode::deserialize(clientkey_bytes).expect("Failed to deserialize into `ClientKey`"),
+        );
+        ptr_args = rest;
+
+        if rest.is_empty() {
+            return handles;
+        }
+    }
+}
+
 // TODO: make those `split_args_to_*` a macro.
-fn split_args_to_handles(args: &[u8]) -> Vec<u32> {
+fn _split_args_to_handles(args: &[u8]) -> Vec<u32> {
     let mut ptr_args = args;
     let mut handles = vec![];
 

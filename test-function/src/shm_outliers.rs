@@ -1,3 +1,4 @@
+use anna_api::ClientKey;
 use essa_api::*;
 
 fn to_measure_matrix() -> &'static str {
@@ -67,44 +68,31 @@ function(metric_vector) {
 }
 
 #[essa_wrap(name = "get_pzt_batch")]
-pub fn get_pzt_batch_measures(pzt_id: u64, cycle: u64) -> Option<ResultHandle> {
-    let a = essa_api::datafusion_run(
+pub fn get_pzt_batch_measures(pzt_id: u64, cycle: u64) -> ClientKey {
+    let pzt_batch_measure = essa_api::datafusion_run(
         &format!("SELECT sensor_id, resistencia, frequencia, temperatura, ciclo FROM aquisicoes WHERE sensor_id={} AND ciclo={}", pzt_id, cycle),
         "/home/ceciliacsilva/Desktop/delta-rs/pzt13",
     );
-    println!("batch = {:?}", a);
+    println!("batch = {:?}", pzt_batch_measure);
+    let a = pzt_batch_measure.unwrap();
+    let key = a.get_key().unwrap();
+    println!("key batch = {:?}", key);
 
-    let pzt_batch_measures = a.unwrap();
-    let sensor_id = essa_api::run_r(
-        "function(pzt_batch_measures){
-            return(pzt_batch_measures$sensor_id[[1]])
-}",
-        &[pzt_batch_measures.get_key()],
-    )
-    .unwrap();
-
-    let _ = deltalake_save(
-        "/home/ceciliacsilva/Desktop/delta-rs/teste-dentro-funcao",
-        &[
-            sensor_id.get_key(),
-        ],
-    )
-    .unwrap();
-
-    Some(pzt_batch_measures)
+    key
 }
 
 #[essa_wrap(name = "rm_outliers_extern")]
-pub fn rm_outliers(pzt_batch_measures: ResultHandle) -> bool {
-    println!("Running shm outliers removal!");
-
-    println!("handle pzt_batch_measures: {:?}", pzt_batch_measures);
+pub fn rm_outliers(pzt_batch_measures: ClientKey) -> bool {
+    println!(
+        "Running shm outliers removal!: client key: {:?}",
+        pzt_batch_measures
+    );
 
     let sensor_id = essa_api::run_r(
         "function(pzt_batch_measures){
             return(pzt_batch_measures$sensor_id[[1]])
 }",
-        &[pzt_batch_measures.get_key()],
+        &[pzt_batch_measures.clone()],
     )
     .unwrap();
 
@@ -112,7 +100,7 @@ pub fn rm_outliers(pzt_batch_measures: ResultHandle) -> bool {
         "function(pzt_batch_measures){
             return(pzt_batch_measures$ciclo[[1]])
 }",
-        &[pzt_batch_measures.get_key()],
+        &[pzt_batch_measures.clone()],
     )
     .unwrap();
 
@@ -120,7 +108,7 @@ pub fn rm_outliers(pzt_batch_measures: ResultHandle) -> bool {
         "function(pzt_batch_measures){
             return(length(pzt_batch_measures$resistencia))
 }",
-        &[pzt_batch_measures.get_key()],
+        &[pzt_batch_measures.clone()],
     )
     .unwrap();
 
@@ -128,7 +116,7 @@ pub fn rm_outliers(pzt_batch_measures: ResultHandle) -> bool {
         "function(pzt_batch_measures){
             return(length(pzt_batch_measures$frequencia[[1]]))
 }",
-        &[pzt_batch_measures.get_key()],
+        &[pzt_batch_measures.clone()],
     )
     .unwrap();
 
@@ -136,16 +124,16 @@ pub fn rm_outliers(pzt_batch_measures: ResultHandle) -> bool {
         "function(pzt_batch_measures){
             return(median(pzt_batch_measures$temperatura))
 }",
-        &[pzt_batch_measures.get_key()],
+        &[pzt_batch_measures.clone()],
     )
     .unwrap();
 
     let measure_matrix = essa_api::run_r(
         to_measure_matrix(),
         &[
-            pzt_batch_measures.get_key(),
-            batch_size.get_key(),
-            frequency_points_qnt.get_key(),
+            pzt_batch_measures.clone(),
+            batch_size.get_key().unwrap(),
+            frequency_points_qnt.get_key().unwrap(),
         ],
     )
     .unwrap();
@@ -153,9 +141,9 @@ pub fn rm_outliers(pzt_batch_measures: ResultHandle) -> bool {
     let median_impedance_r = essa_api::run_r(
         to_median_impedance(),
         &[
-            measure_matrix.get_key(),
-            batch_size.get_key(),
-            frequency_points_qnt.get_key(),
+            measure_matrix.get_key().unwrap(),
+            batch_size.get_key().unwrap(),
+            frequency_points_qnt.get_key().unwrap(),
         ],
     )
     .unwrap();
@@ -163,24 +151,24 @@ pub fn rm_outliers(pzt_batch_measures: ResultHandle) -> bool {
     let metric_vector = essa_api::run_r(
         metric_calculation(),
         &[
-            measure_matrix.get_key(),
-            median_impedance_r.get_key(),
-            batch_size.get_key(),
-            frequency_points_qnt.get_key(),
+            measure_matrix.get_key().unwrap(),
+            median_impedance_r.get_key().unwrap(),
+            batch_size.get_key().unwrap(),
+            frequency_points_qnt.get_key().unwrap(),
         ],
     )
     .unwrap();
 
     let outliers_position =
-        essa_api::run_r(outliers_positions(), &[metric_vector.get_key()]).unwrap();
+        essa_api::run_r(outliers_positions(), &[metric_vector.get_key().unwrap()]).unwrap();
 
     // TODO: this should be better.
     let _ = deltalake_save(
         "/home/ceciliacsilva/Desktop/delta-rs/metric-vector",
         &[
-            metric_vector.get_key(),
-            cycle.get_key(),
-            sensor_id.get_key(),
+            metric_vector.get_key().unwrap(),
+            cycle.get_key().unwrap(),
+            sensor_id.get_key().unwrap(),
         ],
     )
     .unwrap();
@@ -189,10 +177,10 @@ pub fn rm_outliers(pzt_batch_measures: ResultHandle) -> bool {
     let _ = deltalake_save(
         "/home/ceciliacsilva/Desktop/delta-rs/median",
         &[
-            median_impedance_r.get_key(),
-            sensor_id.get_key(),
-            cycle.get_key(),
-            temperature_median.get_key(),
+            median_impedance_r.get_key().unwrap(),
+            sensor_id.get_key().unwrap(),
+            cycle.get_key().unwrap(),
+            temperature_median.get_key().unwrap(),
         ],
     )
     .unwrap();
@@ -201,9 +189,9 @@ pub fn rm_outliers(pzt_batch_measures: ResultHandle) -> bool {
     let _ = deltalake_save(
         "/home/ceciliacsilva/Desktop/delta-rs/outliers",
         &[
-            outliers_position.get_key(),
-            cycle.get_key(),
-            sensor_id.get_key(),
+            outliers_position.get_key().unwrap(),
+            cycle.get_key().unwrap(),
+            sensor_id.get_key().unwrap(),
         ],
     )
     .unwrap();

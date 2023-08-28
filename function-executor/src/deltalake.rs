@@ -84,7 +84,7 @@ pub async fn polars_loop(zenoh: Arc<zenoh::Session>, _zenoh_prefix: &str) -> any
     let mut anna_client = new_anna_client(zenoh).await?;
 
     loop {
-        match
+        match reply.recv_async().await {
             Ok(query) => {
                 let mut topic_split = query.key_expr().as_str().split('/');
                 let delta_table_key: String = topic_split
@@ -179,7 +179,7 @@ pub async fn polars_loop(zenoh: Arc<zenoh::Session>, _zenoh_prefix: &str) -> any
                     .await
                     .expect("Failed to send the `reply` back");
 
-                log::info!("Sending Result back to {query.key_expr:?}");
+                log::info!("Sending Result back to {:?}", query.key_expr());
             }
             Err(e) => {
                 log::info!("zenoh error {e:?}");

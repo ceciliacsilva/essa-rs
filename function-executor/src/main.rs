@@ -68,9 +68,7 @@ async fn main() -> anyhow::Result<()> {
         let args = args.clone();
 
         tokio::spawn(async move {
-            if let Err(err) =
-                function_call_receive_loop(args, zenoh, zenoh_prefix).await
-            {
+            if let Err(err) = function_call_receive_loop(args, zenoh, zenoh_prefix).await {
                 log::error!("{:?}", err)
             }
         });

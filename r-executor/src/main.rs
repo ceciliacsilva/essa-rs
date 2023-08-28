@@ -130,7 +130,9 @@ async fn r_executor(
 
                     let dataframes: Vec<r_polars::polars::prelude::DataFrame> = args_from_anna_vec
                         .iter()
-                        .map(|args_from_anna| bincode::deserialize(&args_from_anna).unwrap())
+                        .map(|args_from_anna| {
+                            bincode::deserialize(&args_from_anna).unwrap()
+                        })
                         .collect();
 
                     let r_dataframes: Vec<r_polars::rdataframe::DataFrame> = dataframes
