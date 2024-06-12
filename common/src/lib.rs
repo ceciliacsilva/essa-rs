@@ -3,6 +3,24 @@
 
 #![warn(missing_docs)]
 
+/// R-Arguments representation.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct Rargs {
+    // In the future this should not be retricted to Vec<f64>.
+    // XXX: should be &str instead of String??
+    /// Vector with labels and Vec<f64>.
+    pub args: Option<Vec<(String, Vec<f64>)>>,
+}
+
+/// R-Return representation.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct Rreturn {
+    // In the future this should not be retricted to Vec<f64>.
+    // XXX: should be &str instead of String??
+    /// Vector with labels and Vec<f64>.
+    pub result: Option<Vec<f64>>,
+}
+
 /// The default topic prefix for zenoh, used by all essa code.
 pub fn essa_default_zenoh_prefix() -> &'static str {
     "essa"
@@ -52,4 +70,35 @@ pub fn executor_run_function_topic(
     args: &str,
 ) -> String {
     format!("{zenoh_prefix}/executor/{executor_id}/run-function/{module}/{function}/{args}")
+}
+
+/// Subtopic for instructing a `r-executor` to the a `r-function` with
+/// the given `args`.
+pub fn executor_run_r_topic(
+    zenoh_prefix: &str,
+    executor_id: u32,
+    function: &str,
+    args: &str,
+) -> String {
+    format!("{zenoh_prefix}/r-executor/{executor_id}/{function}/{args}")
+}
+
+/// Topic of a given `r-executor` to subscribe to receive
+/// `r-function`s to be ran.
+pub fn executor_run_r_subscribe_topic(zenoh_prefix: &str, executor_id: u32) -> String {
+    format!("{zenoh_prefix}/r-executor/{executor_id}/**")
+}
+
+/// Topic to submit `r-function`s to be schedule.
+pub fn scheduler_run_r_topic(zenoh_prefix: &str) -> String {
+    format!("{zenoh_prefix}/r-run/**")
+}
+
+/// The subtopic for invoking a specific function of a specific module.
+pub fn scheduler_run_r_function_call_topic(
+    zenoh_prefix: &str,
+    function: &str,
+    args: &str,
+) -> String {
+    format!("{zenoh_prefix}/r-run/{function}/{args}",)
 }

@@ -6,10 +6,14 @@
 use std::{thread, time::Duration};
 
 use crate::c_api::{
-    essa_get_args, essa_get_lattice_data, essa_get_lattice_len, essa_put_lattice, essa_set_result,
+    essa_dataframe_new, essa_get_args, essa_get_lattice_data, essa_get_lattice_len,
+    essa_get_result_key, essa_get_result_key_len, essa_put_lattice, essa_run_r, essa_series_new,
+    essa_set_result,
 };
 use anna_api::{ClientKey, LatticeValue};
-use c_api::{essa_call, essa_get_result, essa_get_result_len};
+use c_api::{
+    essa_call, essa_datafusion_run, essa_deltalake_save, essa_get_result, essa_get_result_len,
+};
 
 /// Re-export the dependencies on serde and bincode to allow downstream
 /// crates to use the exact same version.
@@ -86,12 +90,175 @@ pub fn call_function(function_name: &str, args: &[u8]) -> Result<ResultHandle, E
     }
 }
 
+/// Invokes the specified R function on a different node.
+///
+/// The `args` argument specifies a byte array that should be passed to
+/// the external function as arguments. This is typically a serialized
+/// struct.
+///
+/// This function is an abstraction over [`c_api::essa_run_r`].
+pub fn run_r(function: &str, args: &[ClientKey]) -> Result<ResultHandle, EssaResult> {
+    let mut result_handle = 0;
+
+    // TODO: this should not be hardcoded.
+    let size_clientkey_serialized = 44;
+
+    let serialized_args: Vec<Vec<u8>> = args
+        .iter()
+        .map(|key| bincode::serialize(key).unwrap())
+        .collect();
+
+    let serialized_args = serialized_args.concat();
+
+    let result = unsafe {
+        essa_run_r(
+            function.as_ptr(),
+            function.len(),
+            serialized_args.as_ptr(),
+            size_clientkey_serialized * args.len(),
+            &mut result_handle,
+        )
+    };
+
+    match result {
+        i if i == EssaResult::Ok as i32 => Ok(ResultHandle(result_handle)),
+        other => return Err(other.try_into().unwrap()),
+    }
+}
+
+/// Involkes the given `query` into a `deltalake` using `Datafusion`.
+pub fn datafusion_run(sql_query: &str, table: &str) -> Result<ResultHandle, EssaResult> {
+    let mut result_handle = 0;
+    let result = unsafe {
+        essa_datafusion_run(
+            sql_query.as_ptr(),
+            sql_query.len(),
+            table.as_ptr(),
+            table.len(),
+            &mut result_handle,
+        )
+    };
+
+    match result {
+        i if i == EssaResult::Ok as i32 => Ok(ResultHandle(result_handle)),
+        other => return Err(other.try_into().unwrap()),
+    }
+}
+
+/// Involkes save to `deltalake` the given `dataframe`.
+pub fn deltalake_save(
+    table_path: &str,
+    dataframe_handles: &[ClientKey],
+) -> Result<ResultHandle, EssaResult> {
+    let mut result_handle = 0;
+    // TODO: this should not be hardcoded.
+    let size_clientkey_serialized = 44;
+
+    let serialized_args: Vec<Vec<u8>> = dataframe_handles
+        .iter()
+        .map(|key| bincode::serialize(key).unwrap())
+        .collect();
+
+    let serialized_args = serialized_args.concat();
+
+    let result = unsafe {
+        essa_deltalake_save(
+            table_path.as_ptr(),
+            table_path.len(),
+            serialized_args.as_ptr(),
+            size_clientkey_serialized * dataframe_handles.len(),
+            &mut result_handle,
+        )
+    };
+
+    match result {
+        i if i == EssaResult::Ok as i32 => Ok(ResultHandle(result_handle)),
+        other => return Err(other.try_into().unwrap()),
+    }
+}
+
+/// `essa_series_new`.
+pub fn series_new(col_name: &str, vec_values: &[f64]) -> Result<ResultHandle, EssaResult> {
+    let mut result_handle = 0;
+    let result = unsafe {
+        essa_series_new(
+            col_name.as_ptr(),
+            col_name.len(),
+            vec_values.as_ptr(),
+            std::mem::size_of::<f64>() * vec_values.len(),
+            &mut result_handle,
+        )
+    };
+
+    match result {
+        i if i == EssaResult::Ok as i32 => Ok(ResultHandle(result_handle)),
+        other => return Err(other.try_into().unwrap()),
+    }
+}
+
+/// `essa_dataframe_new`.
+/// Receives a vec of `ResultHandle`.
+pub fn dataframe_new(vec_series_handle: &[ClientKey]) -> Result<ResultHandle, EssaResult> {
+    let mut result_handle = 0;
+
+    // TODO: this should not be hardcoded.
+    let size_clientkey_serialized = 44;
+
+    let serialized_args: Vec<Vec<u8>> = vec_series_handle
+        .iter()
+        .map(|key| bincode::serialize(key).unwrap())
+        .collect();
+
+    let serialized_args = serialized_args.concat();
+
+    let result = unsafe {
+        essa_dataframe_new(
+            serialized_args.as_ptr(),
+            size_clientkey_serialized * vec_series_handle.len(),
+            &mut result_handle,
+        )
+    };
+
+    match result {
+        i if i == EssaResult::Ok as i32 => Ok(ResultHandle(result_handle)),
+        other => return Err(other.try_into().unwrap()),
+    }
+}
+
 /// Handle to retrieve an asynchronous result of a remote function call.
 ///
 /// To wait on the associated result, use [`wait`](Self::wait).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ResultHandle(usize);
 
 impl ResultHandle {
+    /// Returns the `Handle` usize.
+    pub fn get_key(&self) -> Result<ClientKey, EssaResult> {
+        let mut key_len = 0;
+        let result = unsafe { essa_get_result_key_len(self.0, &mut key_len) };
+        let len = match EssaResult::try_from(result) {
+            Ok(EssaResult::Ok) => key_len,
+            Ok(other) => return Err(other),
+            Err(unknown) => panic!("unknown EssaResult variant `{}`", unknown),
+        };
+
+        let mut key_serialized = vec![0u8; len];
+        let result = unsafe {
+            essa_get_result_key(
+                self.0,
+                key_serialized.as_mut_ptr(),
+                key_serialized.len(),
+                &mut key_len,
+            )
+        };
+        let key: ClientKey =
+            bincode::deserialize(&key_serialized).map_err(|_| EssaResult::UnknownError)?;
+        match result {
+            i if i == EssaResult::Ok as i32 => Ok(key),
+            other => return Err(other.try_into().unwrap()),
+        }
+    }
+
     /// Tries to read the lattice value stored for given key from the key-value
     /// store.
     pub fn wait(self) -> Result<Vec<u8>, EssaResult> {
@@ -204,6 +371,10 @@ pub enum EssaResult {
     NoResult = -6,
     /// Failed to deserialize the result of a called WASM function.
     InvalidResult = -8,
+    /// Failed to call external Service.
+    FailToCallExternal = -9,
+    /// Failed to `put` into `anna`.
+    FailToSaveKVS = -10,
 }
 
 impl std::fmt::Display for EssaResult {
@@ -219,6 +390,8 @@ impl std::fmt::Display for EssaResult {
             }
             Self::NoResult => "a WASM function returned without a prior call to `set_result`",
             Self::InvalidResult => "failed to deserialize the result of a called WASM function",
+            Self::FailToCallExternal => "failed to call external service",
+            Self::FailToSaveKVS => "failed to `put` into `anna`",
         };
         f.write_str(s)
     }

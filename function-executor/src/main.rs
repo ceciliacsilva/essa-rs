@@ -286,6 +286,8 @@ pub enum EssaResult {
     InvalidFunctionSignature = -5,
     NoResult = -6,
     InvalidResult = -8,
+    FailToCallExternal = -9,
+    FailToSaveKVS = -10,
 }
 
 /// Transforms an [`eyre::Report`] to an [`anyhow::Error`].

@@ -57,6 +57,8 @@
 
 // Essa core functions: getting function arguments, setting the function
 // result, and calling a remote function.
+
+use anna_api::ClientKey;
 #[link(wasm_import_module = "host")]
 extern "C" {
     /// Requests the function arguments from the runtime as a serialized byte
@@ -144,6 +146,17 @@ extern "C" {
         value_capacity: usize,
         value_len_ptr: *mut usize,
     ) -> i32;
+
+    /// Get Result `ClientKey` length.
+    pub fn essa_get_result_key_len(result_handle: usize, key_len_ptr: *mut usize) -> i32;
+
+    /// Get Result `ClientKey`
+    pub fn essa_get_result_key(
+        result_handle: usize,
+        key_ptr: *mut u8,
+        key_capacity: usize,
+        key_len_ptr: *mut usize,
+    ) -> i32;
 }
 
 // Functions for reading and writing data to a key-value store.
@@ -200,5 +213,61 @@ extern "C" {
         value_ptr: *mut u8,
         value_capacity: usize,
         value_len_ptr: *mut usize,
+    ) -> i32;
+}
+
+#[link(wasm_import_module = "host")]
+extern "C" {
+    /// Run a remote R function.
+    pub fn essa_run_r(
+        function_name_ptr: *const u8,
+        function_name_len: usize,
+        key_ptr: *const u8,
+        key_len: usize,
+        result_handle: *mut usize,
+    ) -> i32;
+}
+
+#[link(wasm_import_module = "host")]
+extern "C" {
+    /// Run a `query` to `deltalake` using
+    /// `Datafusion`.
+    pub fn essa_datafusion_run(
+        sql_query_ptr: *const u8,
+        sql_query_len: usize,
+        delta_table_ptr: *const u8,
+        delta_table_len: usize,
+        result_handle: *mut usize,
+    ) -> i32;
+
+    /// `Save` data to `deltalake` using
+    /// `delta-rs`.
+    pub fn essa_deltalake_save(
+        table_path: *const u8,
+        table_path_len: usize,
+        dataframe_keys_ptr: *const u8,
+        dataframe_keys_len: usize,
+        result_handle: *mut usize,
+    ) -> i32;
+}
+
+#[link(wasm_import_module = "host")]
+extern "C" {
+    /// Internally calls `Series::new` with the
+    /// given column name and values (a `Vec::<f64>`).
+    pub fn essa_series_new(
+        column_name: *const u8,
+        column_name_len: usize,
+        vec_values: *const f64,
+        vec_values_len: usize,
+        result_handle: *mut usize,
+    ) -> i32;
+
+    /// Internally calls `Dataframe::new` with a vec
+    /// `ResultHandle` for `Series`.
+    pub fn essa_dataframe_new(
+        vec_series: *const u8,
+        vec_series_len: usize,
+        result_handle: *mut usize,
     ) -> i32;
 }

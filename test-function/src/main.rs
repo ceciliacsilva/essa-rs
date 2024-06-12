@@ -1,98 +1,50 @@
-use std::collections::{BTreeSet, HashSet};
+mod shm_outliers;
+mod shm_polinomios;
 
-use anna_api::lattice::{Lattice, SetLattice};
-use anyhow::Context;
-use essa_test_function::{
-    append_foo, concurrent_kvs_test_extern, repeat_string_extern, to_uppercase_extern,
+use crate::{
+    shm_outliers::get_pzt_batch,
+    shm_outliers::rm_outliers_extern,
+    shm_polinomios::{get_median, polinomios_extern},
 };
+use essa_api::{dataframe_new, deltalake_save, series_new};
 
 fn main() {
-    println!("Hello world from test function!");
-    let result = to_uppercase_extern("foobar".into()).expect("extern function call failed");
-    println!("Waiting for result...");
-    let result = result.get().unwrap();
-    println!("Function result: {:?}", result);
+    let pzt_id = 13;
 
-    println!("Storing a set in the kvs");
-    let key = "some-test-key".into();
-    essa_api::kvs_put(
-        &key,
-        &SetLattice::new(["one".into(), "two".into(), "three".into()].into()).into(),
-    )
-    .unwrap();
+    let median = get_median(pzt_id).unwrap().get();
+    println!("median: {:?}", median);
+    if median.is_err() {
+        for cycle in 0..20 {
+            println!("Removing outliers from: {}", cycle);
+            let pzt_batch_measure: Result<anna_api::ClientKey, essa_api::EssaResult> =
+                get_pzt_batch(pzt_id, cycle).unwrap().get();
+            println!("pzt batch measure: {:?}", pzt_batch_measure);
+            let key_pzt_batch_measure = pzt_batch_measure.unwrap();
+            println!("key pzt batch measure: {:?}", key_pzt_batch_measure);
 
-    let result = append_foo(result).expect("extern function call failed");
-    println!("Waiting for result...");
-    let result = result.get().unwrap();
-    println!("Function result: {}", result);
+            let removedp = rm_outliers_extern(key_pzt_batch_measure).unwrap();
+            println!("Outliers removed? {:?}, cycle: {}", removedp.get(), cycle);
+        }
+    }
 
-    println!("Reading the set from the kvs");
-    let lattice = essa_api::kvs_get(&key)
-        .unwrap()
-        .into_set()
-        .unwrap()
-        .into_revealed();
-    println!(
-        "Result: {:?}",
-        lattice
-            .iter()
-            .map(|v| std::str::from_utf8(v))
-            .collect::<Result<HashSet<_>, _>>()
-            .unwrap()
-    );
+    let median = get_median(pzt_id).unwrap().get().unwrap();
+    let polinomiosp = polinomios_extern(median).unwrap().get().unwrap();
+    println!("Polinomios salvos? {:?}", polinomiosp);
 
-    println!("Appending to the set in the kvs");
-    essa_api::kvs_put(
-        &key,
-        &SetLattice::new(["four".into(), "two".into(), "three".into()].into()).into(),
-    )
-    .unwrap();
+    let s1 = series_new("A", &vec![1.0, 2.0]).unwrap();
+    let s2 = series_new("B", &vec![3.0, 4.0]).unwrap();
+    let dataframe = dataframe_new(&vec![s1.get_key().unwrap(), s2.get_key().unwrap()]).unwrap();
 
-    let result = repeat_string_extern(result, 15000).expect("extern function call failed");
-    println!("Waiting for result...");
-    let result = result.get().unwrap();
-    println!("Function result: {}", result.len());
+    let f = essa_api::run_r("
+function(dat) {
+    dat <- data.frame(dat)
+    return(unlist(dat[,1] + c(1.0, 1.0))[1])
+}", &[dataframe.get_key().unwrap()]).unwrap();
 
-    println!("Reading the set from the kvs");
-    let lattice = essa_api::kvs_get(&key)
-        .unwrap()
-        .into_set()
-        .unwrap()
-        .into_revealed();
-    println!(
-        "Result: {:?}",
-        lattice
-            .iter()
-            .map(|v| std::str::from_utf8(v))
-            .collect::<Result<HashSet<_>, _>>()
-            .unwrap()
-    );
-
-    // TODO: this is not working right now. Should be fixed.
-    println!("Running concurrent KVS test");
-    let key: anna_api::ClientKey = "concurrent-kvs_test-key".into();
-    let range_start = 1;
-    let range_end = 10;
-    let result = concurrent_kvs_test_extern(key.clone(), range_start, range_end)
-        .expect("concurrent kvs test call failed");
-    result.get().unwrap().expect("function failed");
-
-    println!("Reading the concurrent KVS test result set from the kvs");
-    let lattice = essa_api::kvs_get(&key)
-        .unwrap()
-        .into_set()
-        .unwrap()
-        .into_revealed();
-    let result_set = lattice
-        .iter()
-        .map(|v| {
-            let s = std::str::from_utf8(v).context("result entry not utf8")?;
-            let i = s.parse().context("result entry not an usize")?;
-            Result::<usize, anyhow::Error>::Ok(i)
-        })
-        .collect::<Result<BTreeSet<_>, _>>()
-        .unwrap();
-    assert_eq!(result_set, (range_start..range_end).collect());
+    let _res = essa_api::deltalake_save(
+        "/home/ceciliacsilva/Desktop/delta-rs/dataframe",
+        &[f.get_key().unwrap()]
+    ).unwrap();
 
     println!("DONE");
 }
